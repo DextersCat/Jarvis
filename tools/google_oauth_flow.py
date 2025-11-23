@@ -13,6 +13,7 @@ import argparse
 import sys
 from pathlib import Path
 import os
+from urllib.parse import urlparse, parse_qs
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -33,8 +34,24 @@ def run_flow(service: str, credentials_file: Path):
     print(f"[{service}] Using client secrets: {credentials_file}")
     print(f"[{service}] Scopes: {scopes}")
     flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), scopes=scopes)
-    # Use console flow (same installed-app pattern; shows URL + asks for code).
-    creds = flow.run_console(prompt="consent")
+    # Manual code flow: print URL, capture redirect URL from user, extract code.
+    auth_url, _ = flow.authorization_url(
+        prompt="consent",
+        access_type="offline",
+        include_granted_scopes="true",
+    )
+    print("\n== COPY THIS URL INTO YOUR BROWSER TO AUTHORIZE ==\n")
+    print(auth_url)
+    print("\nAfter approving, paste the FULL redirect URL here (contains code=...):\n")
+    redirect_response = input("Redirect URL: ").strip()
+    # Extract code
+    parsed = urlparse(redirect_response)
+    code_list = parse_qs(parsed.query).get("code")
+    if not code_list:
+        raise SystemExit("No 'code' found in redirect URL. Please try again.")
+    code = code_list[0]
+    creds = flow.fetch_token(code=code)
+    creds = flow.credentials
     token_path.write_text(creds.to_json())
     print(f"[{service}] Saved token to {token_path}")
 
