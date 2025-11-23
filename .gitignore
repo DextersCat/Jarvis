@@ -1,3 +1,5 @@
+# SECRETS AND TOKENS — DO NOT COMMIT
+
 # Python artifacts
 __pycache__/
 *.pyc

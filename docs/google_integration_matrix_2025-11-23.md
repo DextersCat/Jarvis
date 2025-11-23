@@ -19,3 +19,14 @@
 - To authorize Slides: `python3 tools/google_oauth_flow.py --service slides`
 - To authorize Drive: `python3 tools/google_oauth_flow.py --service drive`
 Use client secrets at `~/.jarvis_tokens/credentials.json` and follow the printed URL.
+
+## Final status (Phase C3)
+- Gmail: PASS
+- Calendar: PASS
+- Tasks: PASS
+- Docs: PASS
+- Sheets: PASS
+- Slides: PASS
+- Drive: PASS
+- Custom Search (JSON API): PASS (key + cx working)
+- Gemini: PARKED — API_KEY_INVALID (external GCP/AI Studio issue; no code change)
