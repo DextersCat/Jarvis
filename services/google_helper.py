@@ -132,12 +132,12 @@ def check_gemini(name: str = "gemini") -> Dict:
         import json
         import urllib.request
 
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={api_key}"
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
         payload = json.dumps({"contents": [{"parts": [{"text": "Health check ping from Jarvis."}]}]}).encode("utf-8")
         req = urllib.request.Request(
-            url,
+            url + "?key=" + api_key,
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=8) as resp:
