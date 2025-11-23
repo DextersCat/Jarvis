@@ -57,29 +57,50 @@ def tasks_check() -> Dict:
 
 
 def docs_check() -> Dict:
+    # ID-less check: list Docs via Drive
     return gh.check_oauth_service(
-        "docs",
-        lambda svc: bool(svc.documents().get(documentId="about:blank").execute()),
+        "drive",
+        lambda svc: bool(
+            svc.files()
+            .list(
+                q="mimeType='application/vnd.google-apps.document'",
+                pageSize=1,
+                fields="files(id)",
+            )
+            .execute()
+        ),
     )
 
 
 def sheets_check() -> Dict:
+    # ID-less check: list Sheets via Drive
     return gh.check_oauth_service(
-        "sheets",
-        lambda svc: len(
-            svc.spreadsheets()
-            .values()
-            .get(spreadsheetId="about:blank", range="A1:A1")
+        "drive",
+        lambda svc: bool(
+            svc.files()
+            .list(
+                q="mimeType='application/vnd.google-apps.spreadsheet'",
+                pageSize=1,
+                fields="files(id)",
+            )
             .execute()
-            .get("values", [])
         ),
     )
 
 
 def slides_check() -> Dict:
+    # ID-less check: list Slides via Drive
     return gh.check_oauth_service(
-        "slides",
-        lambda svc: bool(svc.presentations().get(presentationId="about:blank").execute()),
+        "drive",
+        lambda svc: bool(
+            svc.files()
+            .list(
+                q="mimeType='application/vnd.google-apps.presentation'",
+                pageSize=1,
+                fields="files(id)",
+            )
+            .execute()
+        ),
     )
 
 
