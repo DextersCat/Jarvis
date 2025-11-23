@@ -8,6 +8,8 @@ import logging
 import os
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+import urllib.error
+import urllib.request
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -120,6 +122,10 @@ def check_api_key_service(name: str, required_envs: Tuple[str, ...], call_fn) ->
     try:
         result = call_fn()
         return {"status": "PASS", "detail": result}
+    except urllib.error.HTTPError as exc:
+        content = exc.read()
+        detail = content.decode(errors="ignore") if content else str(exc)
+        return {"status": "FAIL", "detail": f"{exc.code} {detail}"}
     except Exception as exc:  # noqa: BLE001
         return {"status": "FAIL", "detail": repr(exc)}
 
@@ -132,21 +138,18 @@ def check_gemini(name: str = "gemini") -> Dict:
         import json
         import urllib.request
 
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
-        payload = json.dumps({"contents": [{"parts": [{"text": "Health check ping from Jarvis."}]}]}).encode("utf-8")
-        req = urllib.request.Request(
-            url + "?key=" + api_key,
-            data=payload,
-            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            body = resp.read()
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        req = urllib.request.Request(url, method="GET")
         try:
-            data = json.loads(body.decode("utf-8"))
-        except Exception:
-            data = {}
-        return {"status": "PASS", "detail": f"HTTP {resp.status} len={len(body)}"}
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                body = resp.read()
+                data = json.loads(body.decode("utf-8")) if body else {}
+                models = data.get("models", []) if isinstance(data, dict) else []
+                return {"status": "PASS", "detail": f"models={len(models)}"}
+        except urllib.error.HTTPError as exc:
+            content = exc.read()
+            detail = content.decode(errors="ignore") if content else str(exc)
+            return {"status": "FAIL", "detail": f"{exc.code} {detail}"}
     except Exception as exc:  # noqa: BLE001
         msg = str(exc).lower()
         if "permission" in msg or "scope" in msg or "403" in msg:
