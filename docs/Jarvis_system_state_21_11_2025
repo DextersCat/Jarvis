@@ -1,0 +1,495 @@
+# JARVIS SYSTEM STATE — 2025-11-20
+
+**Mode:** Hybrid Local Assistant  
+**Hardware:**  
+- Ai-Pi: Raspberry Pi 5 (Jarvis “Body”)  
+- PC: Windows 11 + WSL2 Ubuntu (Jarvis “Brain”)  
+- GPU: RTX (used by Whisper + LLaMA3 via Ollama)
+
+---
+
+## 1. High-Level Architecture
+
+Jarvis is now a **two-part system**:
+
+- **Ai-Pi (“Body”)**  
+  - Wake word + PTT  
+  - Local STT (Whisper Tiny)  
+  - Simple local intents (time/date)  
+  - Queue + offline handling  
+  - REST API for HUD  
+- **PC (“Brain”)**  
+  - JARVISBrain: LLaMA3 + rich personality, memory, context  
+  - Fable TTS via OpenAI  
+  - WebSocket server for Pi  
+- **HUDs**  
+  - Web HUD on Pi (React + Express)  
+  - Brain HUD on PC (Tkinter buttons & logs)
+
+The screenshot at 10:11 shows the intended state:
+
+- Neural Uplink: **ONLINE**  
+- Core Model: **Ollama Llama 3**  
+- Link Status: **ONLINE**  
+- Event log: “Neural Link Established”, “Heard: What time is it?”, “Local Reply Sent for Fable TTS”.
+
+This matches the code behaviour exactly.
+
+---
+
+## 2. Ai-Pi Layer — `jarvis_lite.py`
+
+**File:** `jarvis_lite.py` :contentReference[oaicite:5]{index=5}  
+
+### Responsibilities
+
+- Run **Porcupine** wake word (“jarvis”) on the Pi audio input.
+- After wake word:
+  1. Record ~4 seconds of audio (16kHz mono).
+  2. Run **local STT** using `faster-whisper` tiny on CPU.
+  3. Produce a transcript string.
+
+- Handle **local intents** *before* calling the Brain:
+  - If transcript asks for **time** → compute London time and formulate:
+    > “The current time in Kent is hh:mm am/pm, Sir.”
+  - If transcript asks for **date** → similar natural language answer.
+  - These are sent to the Brain as:
+    ```json
+    { "type": "simple_local_reply", "text": "<spoken answer>" }
+    ```
+  - Brain only needs to **speak** this using Fable; no LLM call.
+
+- For all other queries → send as:
+  ```json
+  { "type": "chat", "text": "<user transcript>" }
+Maintain a queue of Brain-dependent tasks:
+
+On connection error / Brain down:
+
+Play a calm offline MP3 (Jarvis explanation).
+
+Append the text query to a JSON queue.json on SSD.
+
+On reconnect:
+
+Play boot-up MP3.
+
+Flush queue.json by sending each entry as a normal chat message.
+
+Receive streamed audio from Brain:
+
+tts_chunk messages feed a running aplay process.
+
+tts_end closes playback cleanly.
+
+REST API & HUD Integration
+Binds aiohttp server on port 8766 with endpoints:
+
+GET /api/state
+Returns JSON including:
+
+loop_running / wake status
+
+brain_connected (bool)
+
+CPU / RAM usage
+
+core_model: "Ollama Llama 3"
+
+queue length and recent events
+
+GET /api/events
+Returns the event list shown in the HUD (e.g. “Neural Link Established”, “Heard: …”).
+
+POST /api/action with JSON { "action": ... }
+Handles:
+
+"start" → start wake/voice loop
+
+"stop" → stop loop
+
+"gaming" → set a gaming mode / pause behaviour
+
+"clear_queue" → wipe queued items
+
+The Replit Web HUD (React + Express) talks only to this REST API, and shows AI-Pi and Brain status, core model, and event log.
+
+Current status:
+
+jarvis_lite.py is working when started manually.
+
+Not yet wired to a startup script or systemd service.
+
+HUD correctly reflects its /api/state and /api/events.
+
+3. PC Brain Layer — server.py + jarvis_brain.py
+3.1 WebSocket Bridge — server.py 
+server
+
+Responsibilities:
+
+Listen on WebSocket port 8765.
+
+On client connect, instantiate a JARVISBrain() and stay attached.
+
+Handle two message types from Pi:
+
+simple_local_reply
+
+Payload: { "text": "<final answer string>" }
+
+Behaviour:
+
+Call brain.generate_audio(text) to get Fable MP3 bytes.
+
+Stream them to Pi as tts_chunk + tts_end.
+
+chat
+
+Payload: { "text": "<user query transcript>" }
+
+Behaviour:
+
+Call brain.process_text_input(text) → full LLM response string.
+
+Call brain.generate_audio(response_text) → Fable audio.
+
+Stream audio as above.
+
+It does not:
+
+Decide on intents.
+
+Talk to Google APIs.
+
+Manage HUD; it is purely a bridge.
+
+3.2 Intelligence Core — jarvis_brain.py (JARVISBrain) 
+jarvis_brain
+
+Role: “PC Intelligence Core”, running under WSL2 with GPU.
+
+Models
+LLM / GPT:
+
+Uses Ollama Llama3 through the OpenAI-compatible HTTP endpoint:
+
+base_url='http://localhost:11434/v1'
+
+model='llama3'
+
+This means all reasoning is local, no remote GPT cost.
+
+TTS voice:
+
+Uses a separate OpenAI OpenAI() client:
+
+model='tts-1'
+
+voice='fable'
+
+That is the premium Jarvis voice.
+
+Personality & Memory
+Imports and uses:
+
+PersonalityEngine — system prompt + safety filtering.
+
+JARVISMemory — long-term memory in ~/JARVIS/runtime/memory.
+
+ContextManager — builds XML context for the model.
+
+ProactiveSuggestionEngine — adds optional suggestions.
+
+Time Handling
+Detects time queries with regex (what time is it, what’s the time, etc.).
+
+For time queries:
+
+Compute Europe/London time via ZoneInfo("Europe/London").
+
+Produce answer like:
+
+“The current time in Kent, UK is hh:mm am/pm, Sir.”
+
+Does not call LLaMA3 for time; fully local.
+
+General Query Flow
+Input text arrives from Pi (chat case).
+
+Dangerous input is filtered / sanitised.
+
+Check for TIME intent; respond locally if matched.
+
+Build system prompt:
+
+Personality,
+
+System info (OS, hostname, etc.),
+
+“SYSTEM DATETIME” explicit ground truth.
+
+Add dynamic context XML from memory.
+
+Call LLaMA3 via Ollama with the combined messages.
+
+Append proactive suggestion if any.
+
+Save conversation to memory DB.
+
+Return final answer string to server.py.
+
+TTS
+generate_audio(text):
+
+Calls OpenAI TTS tts-1 with voice fable.
+
+Returns raw audio bytes.
+
+Errors logged and reported.
+
+Current status:
+
+JARVISBrain.test_brain() can be run interactively from terminal.
+
+server.py uses this brain to respond to Pi.
+
+Jarvis has successfully answered via local LLaMA3 + Fable voice.
+
+4. Brain HUD — brain_hud.py
+File: brain_hud.py 
+brain_hud
+
+
+Role: Small Tkinter GUI to control the Brain from Windows.
+
+Button INITIALIZE NEURAL NET:
+
+Calls:
+
+bash
+Copy code
+wsl -d Ubuntu-22.04 -u root /root/JARVIS/start_brain.sh
+This script is expected to:
+
+Activate environment,
+
+Run Ollama,
+
+Launch server.py,
+
+Log to console.
+
+Button SEVER CONNECTION:
+
+Runs pkill -f server.py inside WSL.
+
+Button GAMING PROTOCOL:
+
+Runs pkill -f server.py and pkill -f ollama to free GPU.
+
+Shows animated neural GIF and a scrolling log.
+
+Current status:
+
+Already wrapped by a .bat on Windows so you can double-click “Brain HUD” to control the Brain.
+
+5. Calendar & Email Modules (Present but Not Wired)
+5.1 Calendar — calendar_service.py 
+calendar_service
+
+Uses Google Calendar API with OAuth2.
+
+Config from core.config:
+
+SCOPES_CALENDAR
+
+CALENDAR_TOKEN_FILE
+
+CREDENTIALS_FILE
+
+TIMEZONE_DEFAULT
+
+On initialization:
+
+Loads or refreshes token from CALENDAR_TOKEN_FILE.
+
+If missing/expired, launches manual OAuth flow via InstalledAppFlow and local redirect URL.
+
+Main method:
+
+get_events_for_next_24_hours(timezone_str=TIMEZONE_DEFAULT):
+
+Returns simplified list of events:
+
+start_time, end_time, summary, location.
+
+Stub:
+
+create_event(event_details) — future event creation.
+
+5.2 Email — email_service.py 
+email_service
+
+Uses Gmail API with OAuth2.
+
+Config from core.config:
+
+SCOPES_GMAIL
+
+GMAIL_TOKEN_FILE
+
+CREDENTIALS_FILE
+
+EMAIL_SNIPPET_MAX_LENGTH
+
+On initialization:
+
+Loads/refreshes Gmail token, or runs OAuth flow similar to Calendar.
+
+Main method:
+
+get_unread_emails_since(time_ago: str, max_results: int = 20):
+
+Example time_ago: "1 hour", "24 hours".
+
+Builds query "is:unread after:<timestamp>".
+
+Returns list of:
+
+subject, sender, snippet, labels, priority.
+
+Emails with labels like Action, Meeting, IMPORTANT are marked priority=True.
+
+Current status:
+
+These services are fully implemented but not yet integrated into JARVISBrain.
+
+They represent the next phase: “Calendar Power” and “Email Insight” for Jarvis v1.5.
+
+6. Startup Procedure (Manual, Today)
+6.1 PC Brain
+Open Brain HUD via your existing .bat on Windows.
+
+Click INITIALIZE NEURAL NET.
+
+Watch logs:
+
+Ollama and/or LLaMA3 initialisation messages.
+
+JARVIS BRAIN banner from jarvis_brain.py.
+
+WebSocket server from server.py listening on ws://0.0.0.0:8765.
+
+Wait until it prints “JARVIS BRAIN ONLINE – Ready for commands”.
+
+6.2 Ai-Pi
+SSH into Ai-Pi.
+
+Activate whatever environment you currently use for Jarvis (or system Python, if that’s how you restored it).
+
+Run:
+
+bash
+Copy code
+python3 /path/to/jarvis_lite.py
+In a separate terminal (or the same after it’s started), start the Replit GUI / Express server (e.g. npm start in the HUD directory) if it’s not already auto-started.
+
+On your browser (Pi or PC → Ai-Pi’s IP/hostname):
+
+Open http://ai-pi.local:5000 (or http://<pi-ip>:5000).
+
+Confirm HUD shows:
+
+AI-Pi panel online.
+
+Brain panel ONLINE with “Ollama Llama 3”.
+
+Event stream updating.
+
+6.3 Voice Test
+Ensure both:
+
+Brain HUD shows server up.
+
+Web HUD shows “Neural Link Established”.
+
+On Ai-Pi mic:
+
+Say: “Jarvis, what time is it?”
+
+Expected:
+
+Event log: Heard: "Jarvis what time is it"
+
+Event log: “Local Reply Sent for Fable TTS”.
+
+Fable voice speaks the time.
+
+7. Known Gaps & Next Goals
+7.1 Immediate Next Step (Manual Start Script on Pi)
+Create a small shell script on Ai-Pi (you can think of it as a “.bat file for Linux”) that:
+
+cd into the Jarvis project directory.
+
+Activates the correct Python environment (if any).
+
+Starts jarvis_lite.py with logging.
+
+Optionally starts the HUD/Express server.
+
+For now, keep it manual, launched by you, not systemd.
+Later, this script can become the ExecStart of a proper service.
+
+7.2 Jarvis V1.5 — Calendar & Email
+Wire CalendarService into JARVISBrain:
+
+New intent: “What’s on my calendar today / tomorrow / this week?”
+
+Brain uses calendar events and summarises in Jarvis style.
+
+Wire EmailService:
+
+New intent: “Summarise my important emails from the last X hours.”
+
+Brain fetches unread priority emails and builds a spoken summary.
+
+7.3 Future (Optional)
+Investigate replacing or supplementing Fable with a local TTS on PC (Piper/Coqui), while keeping Fable as premium mode.
+
+More local intents on Pi (handle_local_command):
+
+System status, queue summary, mode report, etc.
+
+Auto-start on boot (Pi & Brain) once manual flow is rock solid.
+
+8. Summary
+You currently have:
+
+A working hybrid Jarvis:
+
+Pi body with wake word, local STT, local time/date, queue, REST API & HUD.
+
+PC brain with LLaMA3 via Ollama, personality, memory, and Fable TTS.
+
+Clear Brain control via Brain HUD.
+
+Calendar & Email modules:
+
+Fully implemented, ready to integrate, not yet wired.
+
+This document is the truth snapshot of JARVIS as of 2025-11-20.
+
+yaml
+Copy code
+
+---
+
+If you save that as `JARVIS_STATE_2025-11-20.md` in your vault, we’ve finally got the **solid baseline** you deserved days ago.
+
+Next, if you’d like, I can give you a *tiny* Codex prompt whose only job is:
+
+> “Create a simple `start_jarvis.sh` on the Pi that runs `jarvis_lite.py` with logs, no systemd, no refactors.”
+
+You stay in control; Jarvis starts with one command; nothing else changes.
+::contentReference[oaicite:11]{index=11}

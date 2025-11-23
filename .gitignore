@@ -1,0 +1,33 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtualenvs
+venv/
+.venv/
+jarvis_env/
+
+# Logs and runtime
+runtime/logs/
+*.log
+
+# Tokens and secrets
+.jarvis_tokens/
+credentials.json
+*token*.json
+
+# Caches / temp
+.tmp/
+tmp/
+cache/
+.idea/
+.vscode/
+
+# Models and large assets
+models/
+voice_assets/
+
+# System
+.DS_Store
