@@ -1,0 +1,11 @@
+realtime_light:
+  model: "llama3"
+  base_url: "http://localhost:11434/v1"
+  api_key: "ollama"
+  description: "Default local profile for realtime responses (current behaviour)."
+
+brain_heavy:
+  model: "llama3"
+  base_url: "http://localhost:11434/v1"
+  api_key: "ollama"
+  description: "Heavier profile using local compute; swap model/base_url here when a stronger local model is available."

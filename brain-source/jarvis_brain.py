@@ -65,6 +65,7 @@ from services.library_index import (
     upsert_item as upsert_library_item,
 )
 from services.email_classifier import classify_email
+from llm_profiles import select_profile
 
 # Load environment variables
 ENV_PATH = Path.home() / "JARVIS" / "config" / ".env"
@@ -91,7 +92,11 @@ class JARVISBrain:
         
         # Core configuration
         # HYBRID: Ollama Llama3 for GPT, OpenAI for TTS (fable voice)
-        self.ai_model = "llama3"
+        profile = select_profile()
+        self.ai_model = profile.get("model", "llama3")
+        self.llm_profile = profile.get("name")
+        self.llm_base_url = profile.get("base_url")
+        self.llm_api_key = profile.get("api_key")
         self.voice_model = "tts-1"
         self.voice_type = "fable"
         
@@ -197,10 +202,10 @@ class JARVISBrain:
             
             # Initialize Ollama (local LLM) + OpenAI (TTS only)
             self.openai_client = OpenAI(
-                base_url='http://localhost:11434/v1',
-                api_key='ollama'  # Local requires no real key
+                base_url=self.llm_base_url or 'http://localhost:11434/v1',
+                api_key=self.llm_api_key or 'ollama'  # Local requires no real key
             )
-            print("Ô£à Ollama llama3 initialized (F:\\JARVIS_MODELS)")
+            print(f"Ô£à LLM profile '{self.llm_profile}' initialized using model {self.ai_model}")
             
             # Separate OpenAI client for TTS (keeps fable voice)
             self.tts_client = OpenAI()
