@@ -12,6 +12,7 @@ Requires: ~/.jarvis_tokens/credentials.json (client secrets) unless overridden v
 import argparse
 import sys
 from pathlib import Path
+import os
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -22,6 +23,8 @@ from services.google_helper import get_service_config  # noqa: E402
 
 
 def run_flow(service: str, credentials_file: Path):
+    # Allow localhost HTTP redirect for installed apps (same as existing Gmail/Calendar flow).
+    os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
     cfg = get_service_config(service)
     scopes = cfg["scopes"]
     token_path: Path = cfg["token"]
