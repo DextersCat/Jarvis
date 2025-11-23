@@ -118,19 +118,30 @@ def check_api_key_service(name: str, required_envs: Tuple[str, ...], call_fn) ->
 
 
 def check_gemini(name: str = "gemini") -> Dict:
-    api_key = os.getenv("GOOGLE_GENAI_API_KEY")
+    api_key = os.getenv("GOOGLE_GENAI_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not api_key:
         return {"status": "NOT CONFIGURED", "detail": "Missing GOOGLE_GENAI_API_KEY"}
     try:
-        import google.generativeai as genai
+        import json
+        import urllib.request
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel("gemini-pro")
-        res = model.generate_content("Health check ping from Jarvis.")
-        text = res.text if hasattr(res, "text") else str(res)
-        return {"status": "PASS", "detail": f"len={len(text)}"}
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={api_key}"
+        payload = json.dumps({"contents": [{"parts": [{"text": "Health check ping from Jarvis."}]}]}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            body = resp.read()
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except Exception:
+            data = {}
+        return {"status": "PASS", "detail": f"HTTP {resp.status} len={len(body)}"}
     except Exception as exc:  # noqa: BLE001
         msg = str(exc).lower()
-        if "permission" in msg or "scope" in msg:
+        if "permission" in msg or "scope" in msg or "403" in msg:
             return {"status": "INSUFFICIENT SCOPE", "detail": repr(exc)}
         return {"status": "FAIL", "detail": repr(exc)}
