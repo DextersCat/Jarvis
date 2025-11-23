@@ -125,12 +125,14 @@ def main():
             results[name] = fn()
         except Exception as exc:  # noqa: BLE001
             results[name] = {"status": "FAIL", "detail": repr(exc)}
+    print(json.dumps(results, indent=2))
+    summary = ", ".join(f"{k}:{v.get('status')}" for k, v in results.items())
+    print(f"Summary: {summary}")
 
     log_dir = Path("/root/JARVIS/runtime/logs/google")
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"google_services_check_{Path(__file__).stem}.log"
     log_path.write_text(json.dumps(results, indent=2))
-    print(json.dumps(results, indent=2))
     print(f"Results logged to {log_path}")
     return 0
 
