@@ -31,3 +31,6 @@ voice_assets/
 
 # System
 .DS_Store
+
+# Local overrides
+.env

@@ -70,6 +70,8 @@ from llm_profiles import select_profile
 # Load environment variables
 ENV_PATH = Path.home() / "JARVIS" / "config" / ".env"
 load_dotenv(ENV_PATH)
+# Optional project-level overrides
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 load_dotenv()
 
 logger = logging.getLogger(__name__)

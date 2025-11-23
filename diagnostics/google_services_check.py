@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict
 
 import sys
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -16,6 +17,9 @@ if str(ROOT) not in sys.path:
 
 from services import google_helper as gh
 
+# Load optional project-level .env for API keys
+load_dotenv(ROOT / ".env")
+load_dotenv()
 
 def gmail_check() -> Dict:
     from services import email_service
