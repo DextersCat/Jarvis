@@ -33,15 +33,8 @@ def run_flow(service: str, credentials_file: Path):
     print(f"[{service}] Using client secrets: {credentials_file}")
     print(f"[{service}] Scopes: {scopes}")
     flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), scopes=scopes)
-    # Align with existing Gmail/Calendar flow: explicit localhost redirect for installed apps.
-    flow.redirect_uri = "http://localhost:8080/"
-    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline", include_granted_scopes="true")
-    print("\n== COPY THIS URL INTO YOUR BROWSER TO AUTHORIZE ==\n")
-    print(auth_url)
-    print("\nAfter approving, paste the full redirect URL here.\n")
-    redirect_response = input("Redirect URL: ").strip()
-    flow.fetch_token(authorization_response=redirect_response)
-    creds = flow.credentials
+    # Use console flow (same installed-app pattern; shows URL + asks for code).
+    creds = flow.run_console(prompt="consent")
     token_path.write_text(creds.to_json())
     print(f"[{service}] Saved token to {token_path}")
 
