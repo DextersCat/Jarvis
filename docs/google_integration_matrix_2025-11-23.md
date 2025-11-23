@@ -11,3 +11,11 @@
 | Drive | (not implemented yet) | NOT CONFIGURED | `python3 diagnostics/google_services_check.py` (drive) | Missing token: ~/.jarvis_tokens/drive_token.json; no Drive module/handler. |
 | Custom Search (CSE) | services/search_service.py (Programmable Search) | NOT CONFIGURED | `python3 diagnostics/google_services_check.py` (custom_search) | Missing env: GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_CX. |
 | Gemini | (not wired into brain) | NOT CONFIGURED | `python3 diagnostics/google_services_check.py` (gemini) | Missing env: GOOGLE_GENAI_API_KEY; no current usage in brain. |
+
+## OAuth flows (manual)
+- To authorize Tasks: `python3 tools/google_oauth_flow.py --service tasks`
+- To authorize Docs: `python3 tools/google_oauth_flow.py --service docs`
+- To authorize Sheets: `python3 tools/google_oauth_flow.py --service sheets`
+- To authorize Slides: `python3 tools/google_oauth_flow.py --service slides`
+- To authorize Drive: `python3 tools/google_oauth_flow.py --service drive`
+Use client secrets at `~/.jarvis_tokens/credentials.json` and follow the printed URL.

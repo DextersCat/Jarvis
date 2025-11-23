@@ -61,6 +61,13 @@ SERVICE_CONFIG = {
 }
 
 
+def get_service_config(name: str) -> Dict:
+    cfg = SERVICE_CONFIG.get(name)
+    if not cfg:
+        raise ValueError(f"Unknown service: {name}")
+    return cfg
+
+
 def load_credentials(token_path: Path, scopes: list) -> Credentials:
     if not token_path.exists():
         raise FileNotFoundError(f"Token missing: {token_path}")
