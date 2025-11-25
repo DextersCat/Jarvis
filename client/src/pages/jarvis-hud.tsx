@@ -5,10 +5,17 @@ const WS_URL = 'ws://localhost:5000/jarvis-ws';
 
 type ChoiceCode = 'A' | 'B' | 'C';
 type ReplyChoices = Partial<Record<ChoiceCode, string>>;
+type EmailSearchResult = {
+  subject?: string;
+  from?: string;
+  date?: string;
+  snippet?: string;
+};
 type ReplyOptionsState = {
   questionId: string | null;
   topic: string | null;
   choices: ReplyChoices | null;
+  emailResults: EmailSearchResult[] | null;
 };
 type PresenceState = 'present' | 'away' | 'unknown';
 
@@ -74,10 +81,12 @@ export default function JarvisHUD() {
     questionId: null,
     topic: null,
     choices: null,
+    emailResults: null,
   });
   const [replyPending, setReplyPending] = useState(false);
+  const [emailPanelExpanded, setEmailPanelExpanded] = useState(true);
   const clearReplyOptions = useCallback(() => {
-    setReplyState({ questionId: null, topic: null, choices: null });
+    setReplyState({ questionId: null, topic: null, choices: null, emailResults: null });
     setReplyPending(false);
   }, []);
 
@@ -94,6 +103,11 @@ export default function JarvisHUD() {
       .filter(Boolean) as { code: ChoiceCode; label: string }[];
   }, [replyState]);
   const hasReplyOptions = Boolean(replyState.questionId && activeChoiceButtons.length > 0);
+  const hasEmailResults =
+    replyState.topic === 'email.search' &&
+    Array.isArray(replyState.emailResults) &&
+    replyState.emailResults.length > 0;
+  const hasReplyContent = hasReplyOptions || hasEmailResults;
   const presenceDisplayTime = useMemo(() => {
     if (!presenceLastUpdate) return '—';
     const parsed = new Date(presenceLastUpdate);
@@ -182,9 +196,50 @@ export default function JarvisHUD() {
       try {
         const message = JSON.parse(event.data);
         if (message.type === 'updateReplyOptions') {
-          const incomingChoices = message.choices || message.options || null;
+          const incomingChoices = message.choices ?? message.options ?? null;
+          const incomingQuestionId = message.question_id ?? message.questionId ?? null;
+          const incomingTopic = message.topic ?? null;
+
+          if (incomingTopic === 'email.search' && Array.isArray(incomingChoices)) {
+            const sanitizedResults = incomingChoices.map((item: any, idx: number) => ({
+              subject: typeof item.subject === 'string' && item.subject.trim().length > 0 ? item.subject : `Result ${idx + 1}`,
+              from:
+                typeof item.from === 'string' && item.from.trim().length > 0
+                  ? item.from
+                  : typeof item.sender === 'string'
+                    ? item.sender
+                    : 'Unknown sender',
+              date: typeof item.date === 'string' ? item.date : typeof item.received === 'string' ? item.received : '',
+              snippet:
+                typeof item.snippet === 'string' && item.snippet.trim().length > 0
+                  ? item.snippet
+                  : typeof item.preview === 'string'
+                    ? item.preview
+                    : typeof item.body === 'string'
+                      ? item.body
+                      : '',
+            }));
+            setReplyState({
+              questionId: incomingQuestionId,
+              topic: incomingTopic,
+              choices: null,
+              emailResults: sanitizedResults,
+            });
+            setReplyPending(false);
+            setEvents((prev) => {
+              const previous = Array.isArray(prev) ? prev : [];
+              const count = sanitizedResults.length;
+              const entry = {
+                timestamp: new Date().toLocaleTimeString(),
+                message: count > 0 ? `Email search: ${count} result${count === 1 ? '' : 's'}.` : 'Email search: no matching messages found.',
+              };
+              return [entry, ...previous].slice(0, 50);
+            });
+            return;
+          }
+
           const normalizedChoices =
-            incomingChoices && typeof incomingChoices === 'object'
+            incomingChoices && typeof incomingChoices === 'object' && !Array.isArray(incomingChoices)
               ? incomingChoices
               : null;
           const hasChoices = !!(
@@ -194,13 +249,13 @@ export default function JarvisHUD() {
               return typeof value === 'string' && value.trim().length > 0;
             })
           );
-          const incomingQuestionId = message.question_id ?? message.questionId ?? null;
 
           if (hasChoices && incomingQuestionId) {
             setReplyState({
               questionId: incomingQuestionId,
-              topic: message.topic ?? null,
+              topic: incomingTopic,
               choices: normalizedChoices,
+              emailResults: null,
             });
             setReplyPending(false);
           } else {
@@ -421,7 +476,7 @@ export default function JarvisHUD() {
               )}
             </div>
             <div className="text-xs flex-1 min-h-0 overflow-y-auto leading-relaxed space-y-2 scrollbar-thin pr-2">
-               {!hasReplyOptions ? (
+               {!hasReplyContent ? (
                  <span className="text-cyan-900 italic opacity-50">{'>'} No active follow-ups</span>
                ) : (
                  <>
@@ -431,24 +486,57 @@ export default function JarvisHUD() {
                        <div className="mt-1 text-cyan-100 font-semibold">{replyState.topic}</div>
                      </div>
                    )}
-                   {activeChoiceButtons.map((option, idx) => (
-                     <button
-                       key={option.code}
-                       onClick={() => handleReplyOptionClick(option.code)}
-                       data-testid={`button-reply-option-${idx}`}
-                       disabled={replyPending}
-                       className={`w-full border border-cyan-500/40 bg-cyan-900/20 rounded px-3 py-2 text-left transition-all group ${
-                         replyPending
-                           ? 'opacity-60 cursor-not-allowed'
-                           : 'hover:bg-cyan-500/20 hover:border-cyan-400 hover:shadow-[0_0_12px_rgba(0,240,255,0.3)]'
-                       }`}
-                     >
-                       <div className="flex items-center gap-2">
-                         <span className="text-cyan-600 font-bold group-hover:text-cyan-400">#{option.code}</span>
-                         <span className="text-cyan-300 group-hover:text-cyan-100 font-['Rajdhani'] tracking-wide">{option.label}</span>
-                       </div>
-                     </button>
-                   ))}
+                   {hasEmailResults && (
+                     <div className="border border-cyan-500/40 bg-cyan-900/10 rounded px-3 py-2">
+                       <button
+                         className="w-full flex justify-between items-center text-cyan-300 text-[11px] uppercase tracking-[0.3em]"
+                         onClick={() => setEmailPanelExpanded((prev) => !prev)}
+                       >
+                         <span>Email search results ({replyState.emailResults?.length ?? 0})</span>
+                         <span>{emailPanelExpanded ? '▴' : '▾'}</span>
+                       </button>
+                       {emailPanelExpanded && (
+                         <div className="mt-2 space-y-2">
+                           {replyState.emailResults?.map((result, idx) => (
+                             <div
+                               key={`${result.subject ?? 'email'}-${idx}`}
+                               className="border border-cyan-500/20 bg-cyan-950/30 rounded px-2 py-2 text-[11px] text-cyan-100"
+                             >
+                               <div className="font-semibold text-cyan-50">{result.subject || `Result ${idx + 1}`}</div>
+                               <div className="text-cyan-400 text-[10px]">
+                                 {result.from || 'Unknown sender'}
+                                 {result.date ? ` • ${result.date}` : ''}
+                               </div>
+                               {result.snippet && (
+                                 <div className="mt-1 text-cyan-200 text-[10px] leading-snug whitespace-pre-line">
+                                   {result.snippet}
+                                 </div>
+                               )}
+                             </div>
+                           ))}
+                         </div>
+                       )}
+                     </div>
+                   )}
+                   {hasReplyOptions &&
+                     activeChoiceButtons.map((option, idx) => (
+                       <button
+                         key={option.code}
+                         onClick={() => handleReplyOptionClick(option.code)}
+                         data-testid={`button-reply-option-${idx}`}
+                         disabled={replyPending}
+                         className={`w-full border border-cyan-500/40 bg-cyan-900/20 rounded px-3 py-2 text-left transition-all group ${
+                           replyPending
+                             ? 'opacity-60 cursor-not-allowed'
+                             : 'hover:bg-cyan-500/20 hover:border-cyan-400 hover:shadow-[0_0_12px_rgba(0,240,255,0.3)]'
+                         }`}
+                       >
+                         <div className="flex items-center gap-2">
+                           <span className="text-cyan-600 font-bold group-hover:text-cyan-400">#{option.code}</span>
+                           <span className="text-cyan-300 group-hover:text-cyan-100 font-['Rajdhani'] tracking-wide">{option.label}</span>
+                         </div>
+                       </button>
+                     ))}
                  </>
                )}
             </div>
