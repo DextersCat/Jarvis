@@ -10,6 +10,7 @@ Based on: Fresh Professional Astra AI with JARVIS Personality Framework
 """
 
 import asyncio
+import inspect
 import logging
 import os
 import platform
@@ -17,6 +18,8 @@ import psutil
 import re
 import socket
 import sys
+import uuid
+from typing import Optional
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -35,6 +38,8 @@ PROJECT_ROOT = BASE_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
+import identity_resolver
+
 # JARVIS personality modules
 from personality_engine import PersonalityEngine
 from context_manager import ContextManager
@@ -42,22 +47,35 @@ from proactive_engine import ProactiveSuggestionEngine
 from jarvis_memory_system import JARVISMemory
 from file_service import JarvisFileService
 from services.search_service import search_web, summarise_search_results
+from services import google_helper
+from agents.email_agent import EmailAgent
 from services.email_service import (
     fetch_unread_summary,
     write_email_summary,
     build_email_markdown,
     search_messages_in_window,
     mark_messages_read,
+    mark_messages_read_action,
+    mark_messages_unread,
+    archive_messages,
+    delete_messages,
+    apply_label,
+    send_email,
+    mark_inbox_unread,
     search_messages_by_criteria,
     fetch_full_message,
     send_reply,
     write_daily_email_summary_section,
+    list_inbox_messages,
 )
 from services.calendar_service import (
     get_today_agenda,
     get_tomorrow_agenda,
     get_next_important_event,
     write_calendar_briefing,
+    create_event as calendar_create_event,
+    update_event as calendar_update_event,
+    delete_event as calendar_delete_event,
 )
 from services.library_index import (
     add_item as add_library_item,
@@ -115,9 +133,17 @@ class JARVISBrain:
             'system_commands': 0,
             'start_time': datetime.now()
         }
+        self.conversation_state = {
+            "awaiting_followup": False,
+            "last_question_id": None,
+        }
+        self.active_question_id = None
+        self.pending_choices = {}
         self.pending_mark_read = None
         self.current_email = None
+        self.current_email_identity = None
         self.pending_reply = None
+        self.email_agent = EmailAgent()
 
         # File service (stub, non-destructive)
         self.file_service = self._init_file_service()
@@ -165,6 +191,582 @@ class JARVISBrain:
                 print("FileService disabled: JARVIS_VAULT_PATH not set (file ops offline).")
 
         return service
+
+    def _preview_text(self, text: str, limit: int) -> str:
+        """Return a safe preview of text for logging."""
+        if text is None:
+            return ""
+        return text[:limit] + ("..." if len(text) > limit else "")
+
+    def _detect_simple_intent(self, text: str) -> str:
+        """Lightweight intent hinting for handshake logging."""
+        if not text:
+            return "empty"
+        lowered = text.lower()
+        if any(word in lowered for word in ["email", "inbox", "gmail"]):
+            return "email"
+        if any(word in lowered for word in ["calendar", "meeting", "schedule"]):
+            return "calendar"
+        if "search" in lowered or "google" in lowered:
+            return "web_search"
+        if "task" in lowered or "todo" in lowered:
+            return "tasks"
+        if "time" in lowered or "date" in lowered:
+            return "time_query"
+        return "general"
+
+    def _run_conversation_handshake(self, raw_text: str) -> dict:
+        """
+        Run the 3-phase handshake to validate and log incoming text.
+        Returns dict with final_text and intent for downstream use.
+        """
+        received_text = (raw_text or "").strip()
+        logger.info("[HANDSHAKE] Phase 1 – Received text: '%s'", self._preview_text(received_text, 80))
+
+        intent = self._detect_simple_intent(received_text)
+        logger.info("[HANDSHAKE] Phase 2 – Intent: %s", intent)
+
+        final_text = received_text
+        logger.info(
+            "[HANDSHAKE] Phase 3 – Final text to LLM (len=%d, preview='%s')",
+            len(final_text),
+            self._preview_text(final_text, 80),
+        )
+
+        return {
+            "final_text": final_text,
+            "intent": intent,
+        }
+
+    def _generate_question_id(self) -> str:
+        """Generate a short question identifier for follow-ups."""
+        return uuid.uuid4().hex[:8]
+
+    def _detect_followup_prompt(self, response_text: str) -> bool:
+        """Detect if the assistant is asking a follow-up question."""
+        if not response_text:
+            return False
+        lowered = response_text.lower()
+        if "would you like more detail" in lowered:
+            return True
+        if "would you like a deeper dive" in lowered:
+            return True
+        if lowered.strip().endswith("?") and "sir" in lowered:
+            return True
+        return False
+
+    def _is_followup_affirmation(self, text: str) -> bool:
+        """Detect simple affirmative follow-up cues."""
+        if not text:
+            return False
+        lowered = text.lower().strip()
+        affirmations = [
+            "yes",
+            "yeah",
+            "sure",
+            "okay",
+            "ok",
+            "please",
+            "tell me more",
+            "more detail",
+            "more details",
+            "a deeper dive",
+            "deeper dive",
+            "go deeper",
+            "continue",
+        ]
+        return any(lowered == a or lowered.endswith(a) for a in affirmations)
+
+    def _build_followup_choices(self, question_id: str, topic: str | None = None, handler: str | None = None, metadata: dict | None = None) -> dict:
+        """Construct a standardized follow-up choices payload."""
+        topic_label = topic or "General follow-up"
+        choices = {
+            "A": f"Deeper dive on {topic_label}",
+            "B": f"Alternate angle on {topic_label}",
+            "C": f"Action on this topic (open resource / create note)",
+        }
+        payload = {
+            "question_id": question_id,
+            "topic": topic_label,
+            "choices": choices,
+        }
+        if handler:
+            payload["handler"] = handler
+        if metadata:
+            payload["metadata"] = metadata
+        self.pending_choices[question_id] = payload
+        return payload
+
+    def _build_followup_prompt(self, choice_key: str, payload: dict) -> str:
+        """Build a concrete follow-up prompt for the LLM."""
+        topic = payload.get("topic") or "this topic"
+        choice_text = payload.get("choices", {}).get(choice_key, "")
+        if choice_key == "A":
+            return f"Please give me a deeper dive into {topic}, expanding on the previous answer."
+        if choice_key == "B":
+            return f"Please provide an alternate angle or additional context on {topic}, building on the previous answer."
+        # Default fallback for unexpected key
+        return f"Please continue with more detail on {topic}."
+
+    def _perform_followup_action(self, payload: dict) -> str:
+        """Placeholder for action choice C - stub with minimal behavior."""
+        topic = payload.get("topic") or "this topic"
+        try:
+            # If a file service is configured, drop a note stub.
+            if self.file_service and getattr(self.file_service, "is_enabled", False):
+                content = f"Follow-up action for topic: {topic}\nGenerated: {datetime.now().isoformat()}\n\n(No action implemented; placeholder note.)"
+                result = self.file_service.create_file(
+                    name="followup_action",
+                    ext="md",
+                    category="actions",
+                    content=content,
+                )
+                if result.get("success"):
+                    return f"Logged an action note for {topic}: {result.get('full_path')}"
+            return f"Action placeholder recorded for {topic} (no further action implemented)."
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FOLLOWUP] Action stub failed: %s", exc)
+            return f"Action placeholder for {topic} (failed to write note: {exc})"
+
+    async def _process_followup_prompt(self, question_id: str, choices: list[str]):
+        """Handle structured follow-up choices (A/B/C)."""
+        payload = self.pending_choices.get(question_id)
+        if not payload:
+            logger.warning("[FOLLOWUP] No pending choices for question_id=%s", question_id)
+            return "I couldn't find the prior topic to continue, Sir."
+
+        logger.info("[FOLLOWUP] choices=%s topic='%s'", choices, payload.get("topic"))
+        responses = []
+        # Clear follow-up waiting state for this branch
+        self.conversation_state["awaiting_followup"] = False
+        self.conversation_state["last_question_id"] = None
+
+        for choice in choices:
+            if choice in ("A", "B"):
+                prompt = self._build_followup_prompt(choice, payload)
+                logger.info("[FOLLOWUP] Built prompt for choice %s: '%s'", choice, prompt)
+                # Run through normal pipeline
+                resp = await self.process_text_input(prompt)
+                responses.append(resp if isinstance(resp, str) else resp.get("spoken_text", ""))
+            elif choice == "C":
+                action_msg = self._perform_followup_action(payload)
+                responses.append(action_msg)
+            else:
+                logger.warning("[FOLLOWUP] Unknown choice '%s' for question_id=%s", choice, question_id)
+
+        # Clear pending choices after processing
+        self.pending_choices.pop(question_id, None)
+        # Join responses sensibly
+        combined = "\n\n".join(r for r in responses if r)
+        return combined or "Follow-up processed."
+
+    async def process_followup_choice(self, question_id: str, choices: list[str]):
+        """Public entry for structured follow-up choices (A/B/C)."""
+        if not question_id:
+            logger.warning("[FOLLOWUP] Missing question_id in followup_choice")
+            return "I need to know which question you're following up on, Sir."
+        if not choices:
+            logger.warning("[FOLLOWUP] Empty choices list for question_id=%s", question_id)
+            return "I didn't receive which option you wanted, Sir."
+        if self.active_question_id and question_id != self.active_question_id:
+            logger.warning(
+                "[FOLLOWUP] Received choice for stale question_id=%s (active=%s)",
+                question_id,
+                self.active_question_id,
+            )
+            return "That follow-up is no longer active, Sir."
+
+        payload = self.pending_choices.get(question_id)
+        if payload and payload.get("handler") == "email_bulk_mark_read":
+            result = await self._handle_email_bulk_followup(payload, choices)
+        elif payload and payload.get("handler") == "calendar_delete_event":
+            result = await self._handle_calendar_delete_followup(payload, choices)
+        elif payload and payload.get("handler") == "email_delete":
+            result = await self._handle_email_delete_followup(payload, choices)
+        else:
+            result = await self._process_followup_prompt(question_id, choices)
+
+        # Clear active question after handling
+        self.active_question_id = None
+        await self._clear_reply_options()
+        return result
+
+    async def _emit_hud_event(self, payload: dict):
+        """Safely emit HUD event if sink is available."""
+        sink = getattr(self, "hud_event_sink", None)
+        if not sink:
+            return
+        try:
+            result = sink(payload)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[HUD_ERROR] Failed to send HUD event: %s", exc)
+
+    async def _clear_reply_options(self):
+        """Clear reply options on HUD (defensive)."""
+        try:
+            if hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
+                await self._emit_hud_event({
+                    "type": "followup_choices",
+                    "question_id": None,
+                    "choices": {},
+                    "topic": None,
+                })
+                logger.info("[HUD] Cleared reply options")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[HUD_ERROR] Failed to clear reply options: %s", exc)
+
+    def _select_recent_messages(self, count: int = 1, unread_only: bool = False) -> list[dict]:
+        """Select recent messages as a heuristic target."""
+        try:
+            from_time = datetime.now(timezone.utc) - timedelta(days=7)
+            messages = search_messages_in_window(from_time, None, unread_only=unread_only, max_items=count)
+            return messages[:count]
+        except Exception as exc:
+            logger.error("[EmailSelect] Failed to select recent messages: %s", exc)
+            return []
+
+    def _is_email_bulk_risky(self, text: str) -> bool:
+        """Detect risky bulk mark-read intents (read/red ambiguity)."""
+        if not text:
+            return False
+        normalized = re.sub(r"[^a-z0-9 ]+", " ", text.lower()).strip()
+        if "mark" not in normalized or "all" not in normalized:
+            return False
+        if not any(k in normalized for k in ["email", "mail", "inbox", "messages"]):
+            return False
+        if "read" in normalized or "red" in normalized:
+            return True
+        return False
+
+    def _parse_followup_option(self, text: str) -> list[str] | None:
+        """Parse simple follow-up option selections (e.g., 'Option B', 'B', 'cancel')."""
+        if not text:
+            return None
+        normalized = re.sub(r"[^a-z0-9 ]+", " ", text.lower()).strip()
+        if normalized in {"option a", "a"}:
+            return ["A"]
+        if normalized in {"option b", "b"}:
+            return ["B"]
+        if normalized in {"option c", "c", "cancel"}:
+            return ["C"]
+        return None
+
+    async def _handle_email_bulk_followup(self, payload: dict, choices: list[str]):
+        """Handle structured follow-up choices for risky email bulk actions."""
+        question_id = payload.get("question_id")
+        choice = None
+        for ch in choices:
+            if ch in ("A", "B", "C"):
+                choice = ch
+                break
+        if not choice:
+            return "I didn't catch which option you wanted, Sir."
+
+        # Clear awaiting state for this flow
+        self.conversation_state["awaiting_followup"] = False
+        self.conversation_state["last_question_id"] = None
+        self.pending_choices.pop(question_id, None)
+
+        if choice == "C":
+            return "Understood. I won't change any emails, Sir."
+
+        filter_since = None
+        filter_label = "all_unread"
+        if choice == "B":
+            london_tz = ZoneInfo("Europe/London")
+            now = datetime.now(london_tz)
+            filter_since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            filter_label = "unread_since_today"
+
+        result = await asyncio.to_thread(mark_inbox_unread, filter_since, 500)
+        if not isinstance(result, dict):
+            return "Email action did not return a structured result, Sir."
+
+        if not result.get("success"):
+            err = result.get("error") or "unknown error"
+            return f"I couldn't change your emails because Google returned: {err}"
+
+        count = result.get("marked", 0)
+        scope = result.get("scope", "inbox")
+        return f"I've marked {count} emails as read in your {scope}, Sir."
+
+    async def _handle_email_bulk_risky(self, original_text: str):
+        """Emit follow-up choices for risky bulk email commands."""
+        question_id = self._generate_question_id()
+        topic = "Email bulk action confirmation"
+        choices = {
+            "A": "Mark all emails as read",
+            "B": "Mark only today's unread emails as read",
+            "C": "Cancel — do nothing",
+        }
+        payload = {
+            "question_id": question_id,
+            "topic": topic,
+            "choices": choices,
+            "handler": "email_bulk_mark_read",
+            "metadata": {"origin_text": original_text},
+        }
+        self.pending_choices[question_id] = payload
+        self.conversation_state["awaiting_followup"] = True
+        self.conversation_state["last_question_id"] = question_id
+
+        question_text = (
+            "You asked me to mark all your emails read. Just to be safe: "
+            "A: Mark all emails as read; B: Mark only today's unread emails as read; "
+            "C: Cancel."
+        )
+
+        try:
+            if hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
+                await self._emit_hud_event({
+                    "type": "followup_choices",
+                    "question_id": question_id,
+                    "topic": topic,
+                    "choices": choices,
+                })
+                logger.info("[FOLLOWUP] Sent followup_choices event for question_id=%s (email bulk)", question_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[FOLLOWUP] Failed to send followup_choices event: %s", exc)
+
+        return question_text
+
+    async def _handle_calendar_delete_followup(self, payload: dict, choices: list[str]):
+        """Handle follow-up choices for calendar delete confirmation."""
+        event = payload.get("event") or {}
+        event_id = event.get("id")
+        summary = event.get("summary", "the event")
+        start = event.get("start", {}) or {}
+        when = start.get("date") or start.get("dateTime") or "the scheduled time"
+        choice = None
+        for ch in choices:
+            if ch in ("A", "B", "C"):
+                choice = ch
+                break
+        if not choice:
+            return "I didn't catch which option you wanted, Sir."
+        if choice == "C":
+            return "Understood, I'll leave it as it is, Sir."
+        if choice == "B":
+            return "I haven't implemented rescheduling via this path yet, Sir; the event is unchanged."
+        # choice == "A"
+        try:
+            result = await asyncio.to_thread(calendar_delete_event, event_id)
+            if result.get("success"):
+                return f"I've cancelled '{summary}' on {when}, Sir."
+            err = result.get("details", {}).get("error") if isinstance(result, dict) else "unknown error"
+            return f"I couldn't cancel that event because Google returned: {err}"
+        except Exception as exc:
+            logger.error("[CalendarAction] delete_event failed: %s", exc)
+            return f"I couldn't cancel that event: {exc}"
+
+    def _parse_email_send(self, text: str) -> dict | None:
+        """Very simple parser for send email intent."""
+        lower = text.lower()
+        to = None
+        subject = None
+        body = None
+        if "email " in lower:
+            after = text.split("email ", 1)[1]
+        elif "send an email to " in lower:
+            after = text.split("send an email to ", 1)[1]
+        else:
+            return None
+        if " about " in after.lower():
+            parts = re.split(r"about", after, flags=re.IGNORECASE, maxsplit=1)
+            to = parts[0].strip(" ,.")
+            body = parts[1].strip() if len(parts) > 1 else ""
+            subject = body[:60] if body else "No subject"
+        elif " saying " in after.lower():
+            parts = re.split(r"saying", after, flags=re.IGNORECASE, maxsplit=1)
+            to = parts[0].strip(" ,.")
+            body = parts[1].strip() if len(parts) > 1 else ""
+            subject = body[:60] if body else "No subject"
+        else:
+            to = after.strip(" ,.")
+            subject = "No subject"
+            body = ""
+        if not to:
+            return None
+        return {"to": to, "subject": subject or "No subject", "body": body or ""}
+
+    def _extract_count(self, text: str, default: int = 1) -> int:
+        match = re.search(r"last\s+(\d+)", text.lower())
+        if match:
+            try:
+                return max(1, int(match.group(1)))
+            except Exception:
+                return default
+        return default
+
+    async def _handle_email_send(self, text: str):
+        parsed = self._parse_email_send(text)
+        if not parsed:
+            return "I couldn't parse the recipient or message, Sir."
+        try:
+            result = await asyncio.to_thread(
+                send_email, parsed["to"], parsed["subject"], parsed["body"], None, None
+            )
+            if result.get("success"):
+                return f"Email sent to {parsed['to']} with subject '{parsed['subject']}', Sir."
+            err = result.get("details", {}).get("error") if isinstance(result, dict) else "unknown error"
+            return f"I couldn't send that email because: {err}"
+        except Exception as exc:
+            logger.error("[EmailAction] send_email failed: %s", exc)
+            return f"I couldn't send that email: {exc}"
+
+    async def _handle_email_mark_read(self, text: str):
+        count = self._extract_count(text, default=1)
+        messages = self._select_recent_messages(count, unread_only=False)
+        ids = [m.get("id") for m in messages if m.get("id")]
+        if not ids:
+            return "I couldn't find messages to mark as read, Sir."
+        result = await asyncio.to_thread(mark_messages_read_action, ids)
+        if result.get("success"):
+            return f"I've marked {len(ids)} message(s) as read, Sir."
+        err = result.get("details", {}).get("error") if isinstance(result, dict) else "unknown error"
+        return f"I couldn't mark messages as read because: {err}"
+
+    async def _handle_email_mark_unread(self, text: str):
+        count = self._extract_count(text, default=1)
+        messages = self._select_recent_messages(count, unread_only=False)
+        ids = [m.get("id") for m in messages if m.get("id")]
+        if not ids:
+            return "I couldn't find messages to mark as unread, Sir."
+        result = await asyncio.to_thread(mark_messages_unread, ids)
+        if result.get("success"):
+            return f"I've marked {len(ids)} message(s) as unread, Sir."
+        err = result.get("details", {}).get("error") if isinstance(result, dict) else "unknown error"
+        return f"I couldn't mark messages as unread because: {err}"
+
+    async def _handle_email_archive(self, text: str):
+        count = self._extract_count(text, default=1)
+        messages = self._select_recent_messages(count, unread_only=False)
+        ids = [m.get("id") for m in messages if m.get("id")]
+        if not ids:
+            return "I couldn't find messages to archive, Sir."
+        result = await asyncio.to_thread(archive_messages, ids)
+        if result.get("success"):
+            return f"I've archived {len(ids)} message(s), Sir."
+        err = result.get("details", {}).get("error") if isinstance(result, dict) else "unknown error"
+        return f"I couldn't archive messages because: {err}"
+
+    async def _handle_email_apply_label(self, text: str):
+        count = self._extract_count(text, default=1)
+        label_match = re.search(r"label (.+)", text, flags=re.IGNORECASE)
+        label = label_match.group(1).strip() if label_match else "Label"
+        messages = self._select_recent_messages(count, unread_only=False)
+        ids = [m.get("id") for m in messages if m.get("id")]
+        if not ids:
+            return "I couldn't find messages to label, Sir."
+        result = await asyncio.to_thread(apply_label, ids, label)
+        if result.get("success"):
+            return f"I've applied label '{label}' to {len(ids)} message(s), Sir."
+        err = result.get("details", {}).get("error") if isinstance(result, dict) else "unknown error"
+        return f"I couldn't apply the label because: {err}"
+
+    async def _handle_email_delete(self, text: str):
+        count = self._extract_count(text, default=1)
+        messages = self._select_recent_messages(count, unread_only=False)
+        ids = [m.get("id") for m in messages if m.get("id")]
+        if not ids:
+            return "I couldn't find messages to delete, Sir."
+        question_id = self._generate_question_id()
+        self.active_question_id = question_id
+        self.conversation_state["awaiting_followup"] = True
+        self.conversation_state["last_question_id"] = question_id
+        self.pending_choices[question_id] = {
+            "question_id": question_id,
+            "handler": "email_delete",
+            "message_ids": ids,
+        }
+        prompt = f"Do you want me to delete {len(ids)} message(s), Sir? A: Yes, delete. B: No change. C: Cancel."
+        try:
+            if hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
+                await self._emit_hud_event({
+                    "type": "followup_choices",
+                    "question_id": question_id,
+                    "topic": "Email delete confirmation",
+                    "choices": {"A": "Delete", "B": "Leave unchanged", "C": "Cancel"},
+                })
+                logger.info("[EmailConfirm] Sent followup_choices question_id=%s", question_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[EmailConfirm] Failed to send HUD event: %s", exc)
+        return prompt
+
+    async def _handle_email_delete_followup(self, payload: dict, choices: list[str]):
+        ids = payload.get("message_ids") or []
+        if not ids:
+            return "No messages were selected for deletion, Sir."
+        choice = None
+        for ch in choices:
+            if ch in ("A", "B", "C"):
+                choice = ch
+                break
+        if not choice or choice == "C":
+            return "Understood, I won't delete any emails, Sir."
+        if choice == "B":
+            return "Leaving the emails unchanged, Sir."
+        # A: delete
+        try:
+            result = await asyncio.to_thread(delete_messages, ids)
+            if result.get("success"):
+                return f"I've deleted {len(ids)} message(s), Sir."
+            err = result.get("details", {}).get("error") if isinstance(result, dict) else "unknown error"
+            return f"I couldn't delete those emails because: {err}"
+        except Exception as exc:
+            logger.error("[EmailAction] delete_messages failed: %s", exc)
+            return f"I couldn't delete those emails: {exc}"
+
+    async def _handle_email_search(self, text: str):
+        """Handle email search intents via EmailAgent."""
+        query = self._extract_email_search_query(text)
+        logger.info("[EmailSearch] Detected email search query='%s'", query)
+        intent = {
+            "domain": "email",
+            "action": "search_emails_by_query",
+            "query": query,
+            "max_results": 20,
+        }
+        try:
+            result = await asyncio.to_thread(self.email_agent.execute, intent)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[EmailSearch] EmailAgent failed: %s", exc)
+            return "I couldn't access your email right now, Sir."
+
+        if not isinstance(result, dict):
+            logger.warning("[EmailSearch] Unexpected result type: %s", type(result))
+            return "I couldn't access your email right now, Sir."
+
+        messages = (result.get("data") or {}).get("messages") or []
+        success = result.get("success") or result.get("status") == "ok"
+        if not success:
+            err = result.get("error") or result.get("message") or "unknown error"
+            logger.warning("[EmailSearch] search_emails_by_query failed: %s", err)
+            return "I couldn't search your email right now, Sir."
+
+        try:
+            await self._clear_reply_options()
+            if hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
+                payload = {
+                    "type": "updateReplyOptions",
+                    "question_id": self._generate_question_id(),
+                    "topic": "email.search",
+                    "choices": messages,
+                }
+                await self._emit_hud_event(payload)
+                logger.info(
+                    "[EmailSearch] Sent HUD search results question_id=%s count=%d",
+                    payload["question_id"],
+                    len(messages),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[EmailSearch] Failed to send HUD payload: %s", exc)
+
+        if messages:
+            return f"I found {len(messages)} email(s) matching your search. Check the HUD for details, Sir."
+        return "I didn't find any matching emails, Sir."
 
     def save_system_summary(self, text: str) -> str:
         """
@@ -331,6 +933,17 @@ class JARVISBrain:
         return any(re.search(p, normalized) for p in patterns)
 
     @staticmethod
+    def _is_email_search_intent(text: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower()).strip()
+        if not normalized:
+            return False
+        search_terms = ["search", "find", "look for", "look up", "scan for", "look in", "look through"]
+        email_terms = ["email", "emails", "inbox", "mail", "messages", "gmail"]
+        has_search = any(term in normalized for term in search_terms)
+        has_email = any(term in normalized for term in email_terms)
+        return has_search and has_email
+
+    @staticmethod
     def _is_mark_read_intent(text: str) -> bool:
         normalized = re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
         if "mark" not in normalized or "read" not in normalized:
@@ -422,6 +1035,22 @@ class JARVISBrain:
             sender = lower.split("email from", 1)[1].strip()
         return {"sender": sender, "topic": topic}
 
+    def _extract_email_search_query(self, text: str) -> str:
+        """Extract a Gmail search query from natural language."""
+        if not text:
+            return ""
+        patterns = [
+            r"search (?:my )?(?:emails?|inbox|gmail|mailbox) (?:for|about|regarding)\s+(.+)",
+            r"find (?:emails?|messages?) (?:about|on|regarding)\s+(.+)",
+            r"look (?:in|through|at)\s+(?:my\s+)?(?:emails?|inbox|gmail).*?(?:for|about)\s+(.+)",
+        ]
+        for pat in patterns:
+            match = re.search(pat, text, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip(" .,'\"")
+        # Fallback to full text as query
+        return text.strip()
+
     def _resolve_summary_date(self, text: str) -> str | None:
         lower = (text or "").lower()
         london_tz = ZoneInfo("Europe/London")
@@ -459,6 +1088,119 @@ class JARVISBrain:
         if "next important" in normalized or "next event" in normalized:
             return "next"
         return None
+
+    def _is_calendar_add_event(self, text: str) -> bool:
+        """Detect add/create/schedule calendar event intents."""
+        if not text:
+            return False
+        normalized = re.sub(r"[^a-z0-9 ]+", " ", text.lower()).strip()
+        keywords = ["add", "create", "schedule", "set up", "book"]
+        nouns = ["meeting", "event", "appointment", "calendar"]
+        if any(k in normalized for k in keywords) and any(n in normalized for n in nouns):
+            return True
+        return False
+
+    def _detect_calendar_intent(self, text: str) -> str | None:
+        if self._is_calendar_add_event(text):
+            return "calendar_add_event"
+        lower = (text or "").lower()
+        if any(k in lower for k in ["move", "reschedule", "shift", "update"]) and any(
+            w in lower for w in ["meeting", "event", "appointment", "calendar"]
+        ):
+            return "calendar_update_event"
+        if any(k in lower for k in ["cancel", "delete", "remove"]) and any(
+            w in lower for w in ["meeting", "event", "appointment", "calendar"]
+        ):
+            return "calendar_delete_event"
+        return None
+
+    def _detect_email_intent(self, text: str) -> str | None:
+        normalized = re.sub(r"[^a-z0-9 ]+", " ", (text or "").lower()).strip()
+        if any(k in normalized for k in ["send", "email"]) and "subject" in normalized or normalized.startswith("email "):
+            return "email_send"
+        if "mark" in normalized and "unread" in normalized:
+            return "email_mark_unread"
+        if "mark" in normalized and "read" in normalized:
+            return "email_mark_read"
+        if "archive" in normalized:
+            return "email_archive"
+        if "label" in normalized:
+            return "email_apply_label"
+        if "delete" in normalized or "remove" in normalized:
+            return "email_delete"
+        return None
+
+    def _parse_calendar_add_spec(self, text: str) -> dict:
+        """Lightweight parser for calendar event creation."""
+        lower = text.lower()
+        london_tz = ZoneInfo("Europe/London")
+        now = datetime.now(london_tz)
+
+        # Date resolution
+        date = now.date()
+        if "tomorrow" in lower:
+            date = date + timedelta(days=1)
+        else:
+            weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+            for idx, name in enumerate(weekdays):
+                if name in lower:
+                    today_idx = now.weekday()
+                    target_idx = idx
+                    days_ahead = (target_idx - today_idx) % 7
+                    if days_ahead == 0:
+                        days_ahead = 7
+                    date = date + timedelta(days=days_ahead)
+                    break
+
+        # Time parsing
+        time_match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", lower)
+        start_dt = None
+        end_dt = None
+        all_day = False
+        if time_match:
+            hour = int(time_match.group(1))
+            minute = int(time_match.group(2)) if time_match.group(2) else 0
+            ampm = time_match.group(3)
+            if ampm:
+                if ampm == "pm" and hour != 12:
+                    hour += 12
+                if ampm == "am" and hour == 12:
+                    hour = 0
+            start_dt = datetime(date.year, date.month, date.day, hour, minute, tzinfo=london_tz)
+            end_dt = start_dt + timedelta(minutes=60)
+        else:
+            all_day = True
+            start_dt = datetime(date.year, date.month, date.day, 0, 0, tzinfo=london_tz)
+            end_dt = start_dt + timedelta(days=1)
+
+        # Title extraction
+        title = text.strip()
+        for marker in ["called", "titled", "named"]:
+            if marker in lower:
+                idx = lower.find(marker)
+                title = text[idx + len(marker):].strip(" :\"'") or title
+                break
+        # Trim directive phrases
+        title = re.sub(
+            r"\b(add|create|schedule|set up|put|appointment|meeting|event|calendar)\b",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        ).strip(" ,.-")
+        if not title or len(title.split()) < 2:
+            # fallback: use remaining nouns
+            tokens = [t for t in re.split(r"\s+", text) if t.lower() not in {"add", "create", "schedule", "meeting", "event", "appointment", "calendar", "at", "on", "for", "set"}]
+            title = " ".join(tokens).strip() or "New event"
+
+        return {
+            "title": title,
+            "start": start_dt,
+            "end": end_dt,
+            "all_day": all_day,
+            "description": f"Created by Jarvis from: {text}",
+            "location": None,
+            "timezone": "Europe/London",
+        }
 
     def _build_web_results_markdown(self, query: str, summary: str, results: list[dict], timestamp: datetime) -> str:
         lines = [
@@ -653,22 +1395,99 @@ class JARVISBrain:
         sender = parsed.get("sender")
         topic = parsed.get("topic")
         logger.info("[EmailRead] Detected read-email intent: \"%s\" sender=%s topic=%s", text, sender, topic)
-        try:
-            candidates = await asyncio.to_thread(search_messages_by_criteria, sender, topic, max_items=5)
-        except FileNotFoundError:
-            return "Email access is not configured (missing Gmail token)."
-        except Exception as exc:
-            logger.error("[EmailRead] Search failed: %s", exc)
-            return f"I could not search your email right now: {exc}"
+        # Stage 1: deterministic inbox scan with identity resolution
+        chosen = None
+        canonical = None
+        sender_tokens = []
+        if sender:
+            canonical, sender_tokens = identity_resolver.resolve_input_identity(sender)
+            if not sender_tokens:
+                sender_tokens = [identity_resolver.normalize_token(t) for t in sender.split() if identity_resolver.normalize_token(t)]
+            try:
+                inbox_msgs = await asyncio.to_thread(list_inbox_messages, 100)
+            except FileNotFoundError:
+                return "Email access is not configured (missing Gmail token)."
+            except Exception as exc:
+                logger.error("[EmailRead] Inbox list failed: %s", exc)
+                inbox_msgs = []
+            for msg in inbox_msgs:
+                from_field = (msg.get("from") or "").lower()
+                fields = {"from": from_field}
+                matched_identity = identity_resolver.match_sender_fields(fields)
+                tokens_match = all(tok in identity_resolver.normalize_token(from_field) for tok in sender_tokens)
+                alias_hit = canonical and matched_identity == canonical
+                if tokens_match or alias_hit:
+                    chosen = msg
+                    if not canonical and matched_identity:
+                        canonical = matched_identity
+                    logger.info(
+                        "[EmailRead] Last-from scan tokens=%s matched id=%s subject=\"%s\"",
+                        sender_tokens,
+                        msg.get("id"),
+                        msg.get("subject"),
+                    )
+                    break
 
-        if not candidates:
-            logger.info("[EmailRead] No messages found for query.")
+        # Stage 2: query-based if no match and sender provided
+        if not chosen and sender:
+            query = f"from:({sender})"
+            try:
+                svc = google_helper.build_service("gmail")
+                resp = (
+                    svc.users()
+                    .messages()
+                    .list(userId="me", q=query, maxResults=50)
+                    .execute()
+                )
+                ids = resp.get("messages", [])
+                candidates: list[dict] = []
+                for msg in ids:
+                    detail = (
+                        svc.users()
+                        .messages()
+                        .get(
+                            userId="me",
+                            id=msg["id"],
+                            format="metadata",
+                            metadataHeaders=["From", "Subject", "Date"],
+                        )
+                        .execute()
+                    )
+                    headers = detail.get("payload", {}).get("headers", [])
+                    header_map = {h["name"]: h["value"] for h in headers}
+                    candidates.append(
+                        {
+                            "id": msg["id"],
+                            "threadId": detail.get("threadId"),
+                            "from": header_map.get("From", ""),
+                            "subject": header_map.get("Subject", ""),
+                            "snippet": detail.get("snippet", ""),
+                            "internalDate": detail.get("internalDate"),
+                        }
+                    )
+                logger.info("[EmailRead] Query=%s count=%d", query, len(candidates))
+                if candidates:
+                    chosen = candidates[0]
+            except FileNotFoundError:
+                return "Email access is not configured (missing Gmail token)."
+            except Exception as exc:
+                logger.error("[EmailRead] Stage 2 query failed: %s", exc)
+
+        # Stage 3: no sender provided, take latest inbox
+        if not chosen and not sender:
+            try:
+                inbox_msgs = await asyncio.to_thread(list_inbox_messages, 50)
+                if inbox_msgs:
+                    chosen = inbox_msgs[0]
+                    logger.info("[EmailRead] No sender provided; using latest inbox id=%s", chosen.get("id"))
+            except Exception as exc:
+                logger.error("[EmailRead] Latest inbox fetch failed: %s", exc)
+
+        if not chosen:
+            logger.info("[EmailRead] No messages found for sender=%s", sender)
             return "I could not find an email that matches that description, Sir."
 
-        chosen = candidates[0]
-        logger.info(
-            "[EmailRead] Chosen message_id=%s subject=%s", chosen.get("id"), chosen.get("subject")
-        )
+        logger.info("[EmailRead] Chosen message_id=%s subject=%s", chosen.get("id"), chosen.get("subject"))
         try:
             fetched = await asyncio.to_thread(fetch_full_message, chosen.get("id"))
             if isinstance(fetched, tuple) and len(fetched) >= 2:
@@ -688,6 +1507,13 @@ class JARVISBrain:
             "date": meta.get("date"),
             "body": body,
         }
+        self.current_email_identity = canonical
+        logger.info(
+            "[EmailFocus] set to id=%s subject=\"%s\" from=\"%s\"",
+            meta.get("id"),
+            meta.get("subject"),
+            meta.get("from"),
+        )
 
         # Decide hybrid mode based on body length
         body_len = len(body or "")
@@ -1051,6 +1877,155 @@ class JARVISBrain:
             "vault_path": vault_path,
             "memory_id": memory_id,
         }
+
+    def _list_upcoming_events(self, days_ahead: int = 30) -> list[dict]:
+        """List upcoming events within days_ahead window."""
+        try:
+            service = google_helper.build_service("calendar")
+        except Exception as exc:
+            logger.error("[CalendarList] Failed to init calendar service: %s", exc)
+            return []
+        now = datetime.now(timezone.utc)
+        end = now + timedelta(days=days_ahead)
+        try:
+            resp = (
+                service.events()
+                .list(
+                    calendarId="primary",
+                    timeMin=now.isoformat(),
+                    timeMax=end.isoformat(),
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+            events = resp.get("items", [])
+            logger.info("[CalendarList] Retrieved %d upcoming events", len(events))
+            return events
+        except Exception as exc:
+            logger.error("[CalendarList] Failed to list events: %s", exc)
+            return []
+
+    def _match_calendar_event(self, text: str, events: list[dict]) -> Optional[dict]:
+        """Fuzzy match an event based on date phrase and summary tokens."""
+        lower = (text or "").lower()
+        date_pref = None
+        london_tz = ZoneInfo("Europe/London")
+        now = datetime.now(london_tz).date()
+        if "today" in lower:
+            date_pref = now
+        elif "tomorrow" in lower:
+            date_pref = now + timedelta(days=1)
+        else:
+            weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+            for idx, name in enumerate(weekdays):
+                if name in lower:
+                    days_ahead = (idx - now.weekday()) % 7
+                    if days_ahead == 0:
+                        days_ahead = 7
+                    date_pref = now + timedelta(days=days_ahead)
+                    break
+        tokens = [t for t in re.findall(r"[a-zA-Z]+", text.lower()) if len(t) > 2]
+        best = None
+        best_score = 0
+        for ev in events:
+            start = ev.get("start", {}) or {}
+            start_date = start.get("date")
+            start_dt = start.get("dateTime")
+            ev_date = None
+            if start_date:
+                ev_date = datetime.fromisoformat(start_date).date()
+            elif start_dt:
+                try:
+                    ev_date = datetime.fromisoformat(start_dt.replace("Z", "+00:00")).astimezone(london_tz).date()
+                except Exception:
+                    ev_date = None
+            if date_pref and ev_date and ev_date != date_pref:
+                continue
+            summary = (ev.get("summary") or "").lower()
+            score = sum(1 for t in tokens if t in summary)
+            if score > best_score:
+                best_score = score
+                best = ev
+        if best_score == 0:
+            return None
+        return best
+
+    async def _handle_calendar_add(self, text: str):
+        try:
+            event_spec = self._parse_calendar_add_spec(text)
+            logger.info("[CalendarParse] add_event spec=%s", event_spec)
+            result = await asyncio.to_thread(calendar_create_event, event_spec)
+            if isinstance(result, dict) and result.get("success"):
+                start = result.get("start", {})
+                date_part = start.get("date") or start.get("dateTime") or ""
+                return f"I've added '{result.get('summary')}' on {date_part}, Sir."
+            err = result.get("error") if isinstance(result, dict) else "unknown error"
+            return f"I couldn't add that event because Google returned: {err}"
+        except Exception as exc:
+            logger.error("[CalendarAction] add_event failed: %s", exc)
+            return f"I couldn't add that event: {exc}"
+
+    async def _handle_calendar_update(self, text: str):
+        events = self._list_upcoming_events()
+        target = self._match_calendar_event(text, events)
+        if not target:
+            return "I couldn't confidently identify which event to change, Sir."
+        start = target.get("start", {}) or {}
+        london_tz = ZoneInfo("Europe/London")
+        now = datetime.now(london_tz)
+        # Parse new time/date
+        new_spec = self._parse_calendar_add_spec(text)
+        patch = {}
+        if new_spec.get("all_day"):
+            patch["start"] = {"date": new_spec["start"].date().isoformat()}
+            patch["end"] = {"date": new_spec["end"].date().isoformat()}
+        else:
+            patch["start"] = {"dateTime": new_spec["start"].isoformat(), "timeZone": new_spec.get("timezone", "Europe/London")}
+            patch["end"] = {"dateTime": new_spec["end"].isoformat(), "timeZone": new_spec.get("timezone", "Europe/London")}
+        logger.info("[CalendarParse] update target=%s patch=%s", target.get("id"), patch)
+        try:
+            result = await asyncio.to_thread(calendar_update_event, target.get("id"), patch)
+            if result.get("success"):
+                start_info = result.get("details", {}).get("start", {}) if isinstance(result, dict) else {}
+                date_part = start_info.get("date") or start_info.get("dateTime") or ""
+                return f"I've updated '{result.get('details', {}).get('summary')}' to {date_part}, Sir."
+            err = result.get("details", {}).get("error") if isinstance(result, dict) else "unknown error"
+            return f"I couldn't update that event because Google returned: {err}"
+        except Exception as exc:
+            logger.error("[CalendarAction] update_event failed: %s", exc)
+            return f"I couldn't update that event: {exc}"
+
+    async def _handle_calendar_delete(self, text: str):
+        events = self._list_upcoming_events()
+        target = self._match_calendar_event(text, events)
+        if not target:
+            return "I couldn't confidently identify which event to cancel, Sir."
+        question_id = self._generate_question_id()
+        self.active_question_id = question_id
+        self.conversation_state["awaiting_followup"] = True
+        self.conversation_state["last_question_id"] = question_id
+        self.pending_choices[question_id] = {
+            "question_id": question_id,
+            "handler": "calendar_delete_event",
+            "event": target,
+        }
+        summary = target.get("summary", "the event")
+        start = target.get("start", {}) or {}
+        when = start.get("date") or start.get("dateTime") or "the scheduled time"
+        prompt = f"Do you want me to cancel '{summary}' on {when}, Sir? A: Yes, cancel it. B: Move it instead (not implemented). C: No, leave it."
+        try:
+            if hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
+                await self._emit_hud_event({
+                    "type": "followup_choices",
+                    "question_id": question_id,
+                    "topic": "Calendar delete confirmation",
+                    "choices": {"A": "Cancel it", "B": "Move it instead", "C": "Do nothing"},
+                })
+                logger.info("[CalendarConfirm] Sent followup_choices question_id=%s", question_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[CalendarConfirm] Failed to send HUD event: %s", exc)
+        return prompt
     
     async def process_text_input(self, user_input):
         """
@@ -1060,13 +2035,45 @@ class JARVISBrain:
         try:
             self.stats['conversations'] += 1
 
-            sanitized_input, is_safe, warning = self.personality_engine.filter_dangerous_input(user_input)
-            working_input = sanitized_input if not is_safe else user_input
-            logger.info(f"Intent routing: text='{working_input}'")
+            raw_text = user_input or ""
+
+            if self.conversation_state.get("awaiting_followup"):
+                logger.info(
+                    "[DIALOG] User reply to question_id=%s: '%s'",
+                    self.conversation_state.get("last_question_id") or "unknown",
+                    self._preview_text(raw_text, 80),
+                )
+                last_qid = self.conversation_state.get("last_question_id")
+                pending_payload = self.pending_choices.get(last_qid) if last_qid else None
+                if pending_payload and pending_payload.get("handler") == "email_bulk_mark_read":
+                    parsed_choices = self._parse_followup_option(raw_text)
+                    if parsed_choices:
+                        return await self.process_followup_choice(last_qid, parsed_choices)
+                if pending_payload and pending_payload.get("handler") == "calendar_delete_event":
+                    parsed_choices = self._parse_followup_option(raw_text)
+                    if parsed_choices:
+                        return await self.process_followup_choice(last_qid, parsed_choices)
+                if pending_payload and pending_payload.get("handler") == "email_delete":
+                    parsed_choices = self._parse_followup_option(raw_text)
+                    if parsed_choices:
+                        return await self.process_followup_choice(last_qid, parsed_choices)
+                # If user simply says "more detail"/affirmation and we have structured choices, default to option A.
+                if pending_payload and self._is_followup_affirmation(raw_text):
+                    logger.info("[FOLLOWUP] Affirmation detected; routing to choice A for question_id=%s", last_qid)
+                    return await self._process_followup_prompt(last_qid, ["A"])
+                self.conversation_state["awaiting_followup"] = False
+
+            sanitized_input, is_safe, warning = self.personality_engine.filter_dangerous_input(raw_text)
+            working_input = sanitized_input if not is_safe else raw_text
 
             if not is_safe:
                 print(f"ÔÜá´©Å Security warning: {warning}")
                 working_input = sanitized_input
+
+            handshake_result = self._run_conversation_handshake(working_input)
+            working_input = handshake_result.get("final_text", working_input)
+
+            logger.info("Intent routing: text='%s'", working_input)
 
             if self.pending_mark_read:
                 if self._is_confirmation(working_input):
@@ -1084,6 +2091,10 @@ class JARVISBrain:
                     logger.info("[EmailReply] Decline received for pending reply.")
                     return await self._handle_reply_confirmation(False)
 
+            if self._is_email_search_intent(working_input):
+                logger.info("[EmailSearch] Routing to email search handler: %s", working_input)
+                return await self._handle_email_search(working_input)
+
             search_query = self._extract_search_query(working_input)
             if search_query:
                 logger.info("Routing to web search handler.")
@@ -1097,9 +2108,24 @@ class JARVISBrain:
                 logger.info(f"[EmailRead] Routing to read-email handler: {working_input}")
                 return await self._handle_email_read(working_input)
 
+            if self._is_email_bulk_risky(working_input):
+                logger.info("[EmailBulkRisk] Detected risky bulk email intent: %s", working_input)
+                return await self._handle_email_bulk_risky(working_input)
+
             if self._is_email_intent(working_input):
                 logger.info(f"Routing to EMAIL handler: {working_input}")
                 return await self._handle_email_summary()
+
+            cal_action_intent = self._detect_calendar_intent(working_input)
+            if cal_action_intent == "calendar_add_event":
+                logger.info("[CalendarIntent] add_event: %s", working_input)
+                return await self._handle_calendar_add(working_input)
+            if cal_action_intent == "calendar_update_event":
+                logger.info("[CalendarIntent] update_event: %s", working_input)
+                return await self._handle_calendar_update(working_input)
+            if cal_action_intent == "calendar_delete_event":
+                logger.info("[CalendarIntent] delete_event: %s", working_input)
+                return await self._handle_calendar_delete(working_input)
 
             if self._is_reply_intent(working_input):
                 logger.info(f"[EmailReply] Routing to reply handler: {working_input}")
@@ -1142,7 +2168,16 @@ class JARVISBrain:
                 {"role": "user", "content": working_input},
             ]
 
-            print(f"­ƒñö Processing: '{working_input}'")
+            logger.info(
+                "[DIALOG] Processing (preview): '%s' (len=%d)",
+                self._preview_text(working_input, 80),
+                len(working_input),
+            )
+            logger.info(
+                "[LLM_INPUT] len=%d, preview='%s'",
+                len(working_input),
+                self._preview_text(working_input, 120),
+            )
             response = await asyncio.to_thread(
                 self.openai_client.chat.completions.create,
                 model=self.ai_model,
@@ -1177,6 +2212,37 @@ class JARVISBrain:
                 logger.warning("Spoken response length high: %d chars", spoken_len)
             else:
                 logger.info("Spoken response length: %d chars", spoken_len)
+
+            if self._detect_followup_prompt(ai_response):
+                # Clear any previous active question defensively
+                self.active_question_id = None
+                await self._clear_reply_options()
+                question_id = self._generate_question_id()
+                self.active_question_id = question_id
+                self.conversation_state["awaiting_followup"] = True
+                self.conversation_state["last_question_id"] = question_id
+                choices_payload = self._build_followup_choices(question_id, topic=self._preview_text(working_input, 60))
+                logger.info(
+                    "[DIALOG] Assistant asked a follow-up; awaiting user reply. question_id=%s",
+                    question_id,
+                )
+                try:
+                    # Emit HUD event for follow-up choices if server supports it
+                    if hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
+                        await self._emit_hud_event({
+                            "type": "followup_choices",
+                            "question_id": question_id,
+                            "topic": choices_payload.get("topic"),
+                            "choices": choices_payload.get("choices"),
+                        })
+                        logger.info("[FOLLOWUP] Sent followup_choices event for question_id=%s", question_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[FOLLOWUP] Failed to send followup_choices event: %s", exc)
+            else:
+                self.active_question_id = None
+                self.conversation_state["awaiting_followup"] = False
+                self.conversation_state["last_question_id"] = None
+                await self._clear_reply_options()
 
             return ai_response
 
