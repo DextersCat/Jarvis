@@ -10,7 +10,6 @@ Based on: Fresh Professional Astra AI with JARVIS Personality Framework
 """
 
 import asyncio
-import inspect
 import logging
 import os
 import platform
@@ -23,6 +22,10 @@ from typing import Optional
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import inspect
+import uuid
+from typing import Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -39,6 +42,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 import identity_resolver
+from meaning_normalizer import AstraMeaningNormalizer
 
 # JARVIS personality modules
 from personality_engine import PersonalityEngine
@@ -144,6 +148,7 @@ class JARVISBrain:
         self.current_email_identity = None
         self.pending_reply = None
         self.email_agent = EmailAgent()
+        self.meaning_normalizer = None
 
         # File service (stub, non-destructive)
         self.file_service = self._init_file_service()
@@ -153,6 +158,7 @@ class JARVISBrain:
         
         # Initialize components
         self.init_brain_system()
+        self._init_normalizer()
     
     def _get_system_info(self):
         """Get detailed system information"""
@@ -191,6 +197,15 @@ class JARVISBrain:
                 print("FileService disabled: JARVIS_VAULT_PATH not set (file ops offline).")
 
         return service
+
+    def _init_normalizer(self):
+        """Initialise AstraMeaningNormalizer."""
+        try:
+            self.meaning_normalizer = AstraMeaningNormalizer(self.openai_client, model=self.ai_model)
+            logger.info("[Normalizer] AstraMeaningNormalizer initialised (model=%s)", self.ai_model)
+        except Exception as exc:  # noqa: BLE001
+            self.meaning_normalizer = None
+            logger.warning("[Normalizer] Failed to initialise: %s", exc)
 
     def _preview_text(self, text: str, limit: int) -> str:
         """Return a safe preview of text for logging."""
@@ -719,14 +734,14 @@ class JARVISBrain:
             logger.error("[EmailAction] delete_messages failed: %s", exc)
             return f"I couldn't delete those emails: {exc}"
 
-    async def _handle_email_search(self, text: str):
+    async def _handle_email_search(self, text: str, query: str | None = None):
         """Handle email search intents via EmailAgent."""
-        query = self._extract_email_search_query(text)
-        logger.info("[EmailSearch] Detected email search query='%s'", query)
+        search_query = (query or "").strip() or text
+        logger.info("[EmailSearch] Detected email search query='%s'", search_query)
         intent = {
             "domain": "email",
             "action": "search_emails_by_query",
-            "query": query,
+            "query": search_query,
             "max_results": 20,
         }
         try:
@@ -1034,22 +1049,6 @@ class JARVISBrain:
         if "email from" in lower and not sender:
             sender = lower.split("email from", 1)[1].strip()
         return {"sender": sender, "topic": topic}
-
-    def _extract_email_search_query(self, text: str) -> str:
-        """Extract a Gmail search query from natural language."""
-        if not text:
-            return ""
-        patterns = [
-            r"search (?:my )?(?:emails?|inbox|gmail|mailbox) (?:for|about|regarding)\s+(.+)",
-            r"find (?:emails?|messages?) (?:about|on|regarding)\s+(.+)",
-            r"look (?:in|through|at)\s+(?:my\s+)?(?:emails?|inbox|gmail).*?(?:for|about)\s+(.+)",
-        ]
-        for pat in patterns:
-            match = re.search(pat, text, flags=re.IGNORECASE)
-            if match:
-                return match.group(1).strip(" .,'\"")
-        # Fallback to full text as query
-        return text.strip()
 
     def _resolve_summary_date(self, text: str) -> str | None:
         lower = (text or "").lower()
@@ -2091,9 +2090,19 @@ class JARVISBrain:
                     logger.info("[EmailReply] Decline received for pending reply.")
                     return await self._handle_reply_confirmation(False)
 
-            if self._is_email_search_intent(working_input):
-                logger.info("[EmailSearch] Routing to email search handler: %s", working_input)
-                return await self._handle_email_search(working_input)
+            normalized_intent = None
+            if self.meaning_normalizer:
+                normalized_intent = self.meaning_normalizer.normalize(working_input)
+                if normalized_intent.get("domain") == "clarify":
+                    return normalized_intent.get("question") or "Could you clarify your request, Sir?"
+
+            if normalized_intent and normalized_intent.get("domain") == "email" and normalized_intent.get("action") in {"search", "search_emails_by_query"}:
+                logger.info("[EmailSearch] Routing to email search handler via normalizer: %s", working_input)
+                return await self._handle_email_search(working_input, query=normalized_intent.get("search_term") or working_input)
+            if normalized_intent and normalized_intent.get("domain") == "web_search" and normalized_intent.get("action") == "search":
+                term = normalized_intent.get("search_term") or working_input
+                logger.info("[WebSearch] Routing to web search via normalizer: %s", term)
+                return await self._handle_web_search(term)
 
             search_query = self._extract_search_query(working_input)
             if search_query:
