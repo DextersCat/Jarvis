@@ -1,0 +1,33 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Node / frontend build artifacts
+node_modules/
+client/node_modules/
+server/node_modules/
+GUI/node_modules/
+dist/
+GUI/dist/
+client/dist/
+server/dist/
+build/
+
+# Logs and runtime files
+runtime/
+hud-dev.log
+server-dev.log
+*.log
+*.wav
+
+# Environment / secrets
+.env
+.env.*
+
+# Misc
+.DS_Store
+*.tar.gz
+*.zip
+

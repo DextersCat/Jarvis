@@ -1,0 +1,92 @@
+Project: “Jarvis AI Console — Web HUD (v1)”
+
+Goal:
+Build a single-page web UI (HTML/CSS/JS only, no backend) that looks and feels like an Iron Man / Jarvis HUD, but is lightweight enough to run smoothly on a Raspberry Pi 5 as a static page served by Python.
+
+Layout (one page, responsive):
+
+Dark sci-fi theme (near-black background, cyan/teal accents, subtle glow)
+
+Four main zones:
+
+Central Core (Jarvis Brain)
+
+A neural-network style visual in the centre (SVG or canvas): nodes + connecting lines.
+
+Three visual states:
+
+offline → dim, desaturated, very low glow
+
+online → softly glowing network, occasional subtle pulses
+
+thinking → more animated pulses along connections for a short time
+
+Text under it: Status: Listening / Processing / Speaking / Stopped
+
+Left Panel – AI-Pi
+
+Show:
+
+Loop: RUNNING / STOPPED
+
+Wake: <mode> (e.g. “PTT”, “Wake word”, “Both”)
+
+Local: Time/Date/Tomorrow: AVAILABLE
+
+Last audio at: hh:mm:ss
+
+Right Panel – Brain
+
+Show:
+
+Brain: ONLINE / OFFLINE
+
+Model: Local LLM / OpenAI (just a short label)
+
+Last brain action: one short line (e.g. “TIME_INTENT handled”, “Local LLM reply”)
+
+Bottom Panel – Events & Controls
+
+A small scrollable list for the last ~10 events, each line: [HH:MM:SS] message
+
+Buttons:
+
+Start Jarvis
+
+Stop Jarvis
+
+Test Time (client-side stub for now)
+
+Check Brain (client-side stub for now)
+
+Technical constraints:
+
+No frameworks required; plain HTML/CSS/JS is fine. If you really need one, use something ultra-light.
+
+Assume this page will later receive state updates from a Python backend on Ai-Pi via WebSocket or polling. For now:
+
+Implement stub JS functions that the backend can call from outside:
+
+updateCoreState(coreState) where coreState ∈ ['listening','processing','speaking','stopped']
+
+updateLoopState(isRunning)
+
+updateBrainStatus(isOnline, modelLabel, lastAction)
+
+updateAiPiStatus(wakeMode, lastAudioTime)
+
+addEventLog(message)
+
+These functions should update the DOM and visuals (including the neural-network visual and labels).
+
+Design for smoothness over complexity: subtle CSS transitions / transforms, no heavy 3D.
+
+What I want from you:
+
+A single index.html that includes embedded CSS + JS (or separate style.css + main.js if cleaner).
+
+A visually pleasing, Jarvis-like HUD that feels calm, futuristic, and reassuring — not cluttered.
+
+Clear comments in the JS where I should wire in my backend (Ai-Pi) to call those update functions.
+
+Think of this as the Jarvis brain monitor — I’ll handle the Python side, you just give me the best possible front-end to drop onto a Pi and hook into my existing InterfaceAdapter.

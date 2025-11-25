@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Global Reset for Stark UI */
+body {
+  background-color: #050A14; /* Deep Void Blue */
+  color: #00F0FF;            /* Neon Cyan */
+  margin: 0;
+  font-family: 'Consolas', 'Monaco', monospace; /* Terminal Font */
+  overflow: hidden;          /* No Scrollbars */
+}
+
+/* Custom Scrollbar to match the theme */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.3);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 240, 255, 0.3);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 240, 255, 0.5);
+}
