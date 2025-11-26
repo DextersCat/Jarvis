@@ -90,8 +90,10 @@ class AstraMeaningNormalizer:
             "- Actions allowed: search, summarize, create, update, delete, query, none\n"
             "- NEVER fabricate email content; you only extract intent/queries.\n"
             "- If confidence < 0.4, set domain='clarify' and include a clarifying question.\n"
-            "- Preserve/repair key subject words (e.g., 'pyvision' -> 'Pi Vision', 'nvidea' -> 'Nvidia').\n"
-            "- For email search phrases (search/find/look in my email/gmail/inbox/messages), set domain=email, action=search, and put the core query in search_term.\n"
+            "- You MUST correct obvious spelling/STT errors and normalize merged/missing words. Do not leave clearly broken spellings if intent is clear.\n"
+            "- For any search-like request (e.g., 'search my emails for ...', 'find messages about ...', 'look up ...'), extract the intended search phrase, repair spelling, and output a clean search_term.\n"
+            "- Applies to ANY topic (products, people, companies, projects, keywords). No brand-specific rules. If you repaired or inferred meaning, set fuzzy_allowed=true and pick a reasonable confidence (e.g., 0.7–0.9). If not confident, set domain='clarify' with a short question.\n"
+            "- For email search phrases (search/find/look in my email/gmail/inbox/messages), set domain=email, action=search, and put the cleaned query in search_term.\n"
             "- For web searches (look up / search the web / google), set domain=web_search, action=search, search_term=<query>.\n"
             "- For calendar add/update/delete, set domain=calendar and action=create/update/delete; include title/time/date hints in parameters.\n"
             "- For generic tasks ('remind me', 'todo'), set domain=general_task and action=create.\n"
@@ -159,4 +161,3 @@ class AstraMeaningNormalizer:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[Normalizer] Failed to parse intent JSON: %s", exc)
             return default_intent
-
