@@ -76,7 +76,15 @@ class AstraMeaningNormalizer:
 
         intent = self._parse_intent_text(text)
         if self._sample_logs < self.SAMPLE_LOG_LIMIT:
-            logger.info("[Normalizer] Sample intent: raw='%s' -> %s", safe_text[:80], intent)
+            logger.info(
+                "[Normalizer] Sample intent: raw='%s' domain=%s action=%s search_term=%s fuzzy=%s conf=%.2f",
+                safe_text[:80],
+                intent.get("domain"),
+                intent.get("action"),
+                intent.get("search_term"),
+                intent.get("fuzzy_allowed"),
+                intent.get("confidence", 0.0),
+            )
             self._sample_logs += 1
         return intent
 
@@ -90,6 +98,10 @@ class AstraMeaningNormalizer:
             "- Actions allowed: search, summarize, create, update, delete, query, none\n"
             "- NEVER fabricate email content; you only extract intent/queries.\n"
             "- If confidence < 0.4, set domain='clarify' and include a clarifying question.\n"
+            "- If the user refers to the product/email series 'Pi Vision', normalize any spelling/STT variants "
+            "('pi vision', 'pi vission', 'pivision', 'pyvision', 'pyvission', etc.) to the canonical term 'Pi Vision' "
+            "in the search_term field. When you repair a spelling, keep confidence reasonable (e.g., 0.7–0.9) and set "
+            "fuzzy_allowed=true.\n"
             "- Preserve/repair key subject words (e.g., 'pyvision' -> 'Pi Vision', 'nvidea' -> 'Nvidia').\n"
             "- For email search phrases (search/find/look in my email/gmail/inbox/messages), set domain=email, action=search, and put the core query in search_term.\n"
             "- For web searches (look up / search the web / google), set domain=web_search, action=search, search_term=<query>.\n"
@@ -159,4 +171,3 @@ class AstraMeaningNormalizer:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[Normalizer] Failed to parse intent JSON: %s", exc)
             return default_intent
-
