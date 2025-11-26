@@ -66,8 +66,8 @@ link_handler = logging.FileHandler(link_log_file)
 link_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
 link_logger.addHandler(link_handler)
 
-HEARTBEAT_INTERVAL = 10  # seconds between pings
-HEARTBEAT_TIMEOUT = 10   # seconds to await pong (relaxed to reduce false timeouts during TTS)
+HEARTBEAT_INTERVAL = 15  # seconds between pings (more forgiving during long TTS/HUD work)
+HEARTBEAT_TIMEOUT = 20   # seconds to await pong (reduce false timeouts during TTS)
 TCP_KEEPIDLE = 30        # seconds before kernel keepalive probes
 TCP_KEEPINTVL = 10       # seconds between probes
 TCP_KEEPCNT = 5          # probe count before drop
@@ -160,14 +160,14 @@ class JARVISWebSocketServer:
                     link_logger.debug("[HEARTBEAT] Pong received link=%s", connection_id)
                 except asyncio.TimeoutError:
                     link_logger.warning("[HEARTBEAT] Missed pong; closing link=%s reason=ping_timeout", connection_id)
-                    await websocket.close(code=1011, reason="ping_timeout")
-                    link_logger.warning("[HEARTBEAT] Closed link=%s with code=1011 reason=ping_timeout", connection_id)
+                    await websocket.close(code=1001, reason="ping_timeout")
+                    link_logger.warning("[HEARTBEAT] Closed link=%s with code=1001 reason=ping_timeout", connection_id)
                     return
                 except Exception as exc:  # noqa: BLE001
                     link_logger.error("[HEARTBEAT] Ping failed link=%s error=%s", connection_id, exc)
                     with contextlib.suppress(Exception):
-                        await websocket.close(code=1011, reason="ping_error")
-                        link_logger.warning("[HEARTBEAT] Closed link=%s with code=1011 reason=ping_error", connection_id)
+                        await websocket.close(code=1001, reason="ping_error")
+                        link_logger.warning("[HEARTBEAT] Closed link=%s with code=1001 reason=ping_error", connection_id)
                     return
         except asyncio.CancelledError:
             link_logger.info("[HEARTBEAT] Ping loop cancelled link=%s", connection_id)

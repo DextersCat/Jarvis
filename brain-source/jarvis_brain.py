@@ -239,7 +239,7 @@ class JARVISBrain:
         logger.info("[HANDSHAKE] Phase 1 – Received text: '%s'", self._preview_text(received_text, 80))
 
         intent = self._detect_simple_intent(received_text)
-        logger.info("[HANDSHAKE] Phase 2 – Intent: %s", intent)
+        logger.info("[HANDSHAKE] Phase 2 – Heuristic intent guess (logging only): %s", intent)
 
         final_text = received_text
         logger.info(
@@ -736,15 +736,16 @@ class JARVISBrain:
             logger.error("[EmailAction] delete_messages failed: %s", exc)
             return f"I couldn't delete those emails: {exc}"
 
-    async def _handle_email_search(self, text: str, query: str | None = None):
+    async def _handle_email_search(self, text: str, query: str | None = None, fuzzy_allowed: bool = False):
         """Handle email search intents via EmailAgent."""
         search_query = (query or "").strip() or text
-        logger.info("[EmailSearch] Detected email search query='%s'", search_query)
+        logger.info("[EmailSearch] Detected email search query='%s' fuzzy_allowed=%s", search_query, fuzzy_allowed)
         intent = {
             "domain": "email",
             "action": "search_emails_by_query",
             "query": search_query,
             "max_results": 20,
+            "fuzzy_allowed": fuzzy_allowed,
         }
         try:
             result = await asyncio.to_thread(self.email_agent.execute, intent)
@@ -766,6 +767,7 @@ class JARVISBrain:
         hud_sent = False
         try:
             await self._clear_reply_options()
+            # For topic=email.search the HUD expects a list of email results, not A/B/C options.
             payload = {
                 "type": "updateReplyOptions",
                 "question_id": self._generate_question_id(),
@@ -786,7 +788,9 @@ class JARVISBrain:
             if hud_sent:
                 return f"I found {len(messages)} email(s) matching your search. Check the HUD for details, Sir."
             return f"I found {len(messages)} email(s) matching your search, but I couldn't update the HUD, Sir."
-        return "I didn't find any matching emails, Sir."
+        if hud_sent:
+            return "I didn't find any matching emails, Sir."
+        return "I didn't find any matching emails, and I couldn't update the HUD, Sir."
 
     def save_system_summary(self, text: str) -> str:
         """
@@ -2103,7 +2107,11 @@ class JARVISBrain:
 
             if normalized_intent and normalized_intent.get("domain") == "email" and normalized_intent.get("action") in {"search", "search_emails_by_query"}:
                 logger.info("[EmailSearch] Routing to email search handler via normalizer: %s", working_input)
-                return await self._handle_email_search(working_input, query=normalized_intent.get("search_term") or working_input)
+                return await self._handle_email_search(
+                    working_input,
+                    query=normalized_intent.get("search_term") or working_input,
+                    fuzzy_allowed=bool(normalized_intent.get("fuzzy_allowed")),
+                )
             if normalized_intent and normalized_intent.get("domain") == "web_search" and normalized_intent.get("action") == "search":
                 term = normalized_intent.get("search_term") or working_input
                 logger.info("[WebSearch] Routing to web search via normalizer: %s", term)
