@@ -406,17 +406,19 @@ class JARVISBrain:
         await self._clear_reply_options()
         return result
 
-    async def _emit_hud_event(self, payload: dict):
-        """Safely emit HUD event if sink is available."""
+    async def _emit_hud_event(self, payload: dict) -> bool:
+        """Safely emit HUD event if sink is available. Returns success flag."""
         sink = getattr(self, "hud_event_sink", None)
         if not sink:
-            return
+            return False
         try:
             result = sink(payload)
             if inspect.isawaitable(result):
                 await result
+            return True
         except Exception as exc:  # noqa: BLE001
             logger.warning("[HUD_ERROR] Failed to send HUD event: %s", exc)
+            return False
 
     async def _clear_reply_options(self):
         """Clear reply options on HUD (defensive)."""
@@ -761,16 +763,17 @@ class JARVISBrain:
             logger.warning("[EmailSearch] search_emails_by_query failed: %s", err)
             return "I couldn't search your email right now, Sir."
 
+        hud_sent = False
         try:
             await self._clear_reply_options()
-            if hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
-                payload = {
-                    "type": "updateReplyOptions",
-                    "question_id": self._generate_question_id(),
-                    "topic": "email.search",
-                    "choices": messages,
-                }
-                await self._emit_hud_event(payload)
+            payload = {
+                "type": "updateReplyOptions",
+                "question_id": self._generate_question_id(),
+                "topic": "email.search",
+                "choices": messages,
+            }
+            hud_sent = await self._emit_hud_event(payload)
+            if hud_sent:
                 logger.info(
                     "[EmailSearch] Sent HUD search results question_id=%s count=%d",
                     payload["question_id"],
@@ -780,7 +783,9 @@ class JARVISBrain:
             logger.warning("[EmailSearch] Failed to send HUD payload: %s", exc)
 
         if messages:
-            return f"I found {len(messages)} email(s) matching your search. Check the HUD for details, Sir."
+            if hud_sent:
+                return f"I found {len(messages)} email(s) matching your search. Check the HUD for details, Sir."
+            return f"I found {len(messages)} email(s) matching your search, but I couldn't update the HUD, Sir."
         return "I didn't find any matching emails, Sir."
 
     def save_system_summary(self, text: str) -> str:
