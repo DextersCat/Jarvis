@@ -2,43 +2,10 @@ import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { execFile } from "child_process";
 import { WebSocketServer, WebSocket } from "ws";
-import { storage } from "./storage";
-
-type ReplyChoiceMap = Record<string, string>;
 type PresenceState = "present" | "away" | "unknown";
 type PresenceSnapshot = {
   state: PresenceState;
   last_update: string;
-};
-
-const normalizeReplyChoices = (raw: any): ReplyChoiceMap | null => {
-  if (!raw) return null;
-
-  const map: ReplyChoiceMap = {};
-
-  if (Array.isArray(raw)) {
-    for (const entry of raw) {
-      if (!entry || typeof entry !== 'object') continue;
-      const code = String(
-        entry.code ?? entry.id ?? entry.key ?? entry.letter ?? '',
-      )
-        .trim()
-        .toUpperCase();
-      const label = String(entry.label ?? entry.text ?? entry.value ?? '').trim();
-      if (code && label) {
-        map[code] = label;
-      }
-    }
-  } else if (typeof raw === 'object') {
-    for (const [key, value] of Object.entries(raw)) {
-      const code = key.trim().toUpperCase();
-      if (typeof value === 'string' && code && value.trim()) {
-        map[code] = value.trim();
-      }
-    }
-  }
-
-  return Object.keys(map).length ? map : null;
 };
 
 const openUrlInBrowser = (url: string): Promise<void> =>
@@ -226,31 +193,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   app.post('/api/jarvis/reply-options', (req, res) => {
-    const { type, questionId, question_id, topic } = req.body || {};
-    const rawChoices = req.body?.choices ?? req.body?.options ?? null;
-    const normalizedQuestionId =
-      typeof question_id === 'string'
-        ? question_id
-        : typeof questionId === 'string'
-          ? questionId
-          : null;
-    const normalizedChoices = normalizeReplyChoices(rawChoices);
-    const hasChoices = !!(
-      normalizedChoices && Object.keys(normalizedChoices).length > 0
-    );
-    const shouldClear =
-      type === 'clearReplyOptions' || !normalizedQuestionId || !hasChoices;
+    const body = (req.body && typeof req.body === 'object')
+      ? req.body
+      : {};
 
-    if (shouldClear) {
-      broadcast({ type: 'clearReplyOptions' });
-    } else {
-      broadcast({
-        type: 'updateReplyOptions',
-        question_id: normalizedQuestionId,
-        topic: topic ?? null,
-        choices: normalizedChoices,
-      });
-    }
+    console.log('[HUD-API] reply-options body:', JSON.stringify(body));
+
+    const payload = {
+      type: 'replyOptions',
+      questionId: body.question_id ?? body.questionId ?? null,
+      topic: body.topic ?? null,
+      choices: body.choices ?? body.items ?? [],
+    };
+
+    // Use a standard payload going forward so the HUD can normalize in one place.
+    console.log('[HUD-API] broadcasting replyOptions:', payload);
+    broadcast(payload);
 
     res.json({ success: true });
   });
