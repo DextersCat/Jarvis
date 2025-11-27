@@ -5,41 +5,20 @@ import logging
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-logger = logging.getLogger(__name__)
+from services import google_helper
 
-TOKEN_DIR = Path.home() / ".jarvis_tokens"
-GMAIL_TOKEN_FILE = TOKEN_DIR / "gmail_token.json"
-CREDENTIALS_FILE = TOKEN_DIR / "credentials.json"
-# Align scopes with issued token (read + modify); send scope omitted to avoid invalid_scope.
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/gmail.modify",
-]
+logger = logging.getLogger(__name__)
 
 
 def _load_gmail_service() -> object:
     logger.info("email_service module path: %s", __file__)
-    logger.info("Gmail requested scopes: %s", SCOPES)
-    if not GMAIL_TOKEN_FILE.exists():
-        raise FileNotFoundError(f"Gmail token missing: {GMAIL_TOKEN_FILE}")
-    creds = Credentials.from_authorized_user_file(str(GMAIL_TOKEN_FILE), SCOPES)
-    logger.info("Gmail token scopes (creds.scopes): %s", getattr(creds, "scopes", None))
-    if not creds.valid:
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not CREDENTIALS_FILE.exists():
-                raise FileNotFoundError(f"Gmail credentials missing: {CREDENTIALS_FILE}")
-            raise RuntimeError("Gmail credentials invalid; please re-authenticate.")
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+    logger.info("Gmail requested scopes: %s", google_helper.get_service_config("gmail")["scopes"])
+    return google_helper.build_service("gmail")
 
 
 def _basic_suspicious_score(sender: str, subject: str, snippet: str) -> bool:
@@ -331,6 +310,202 @@ def mark_messages_read(message_ids: List[str]) -> int:
     # Gmail batchModify does not return count; return requested count for now.
     logger.info("[EmailMarkRead] Requested mark-read for %d messages", len(message_ids))
     return len(message_ids)
+
+
+def mark_messages_read_action(message_ids: List[str]) -> Dict[str, Any]:
+    count = mark_messages_read(message_ids)
+    return {
+        "success": True,
+        "action": "mark_messages_read",
+        "details": {"requested": len(message_ids), "marked": count, "ids": message_ids},
+    }
+
+
+def list_inbox_messages(max_results: int = 100) -> List[Dict]:
+    """List latest inbox messages (metadata only)."""
+    service = _load_gmail_service()
+    resp = (
+        service.users()
+        .messages()
+        .list(userId="me", labelIds=["INBOX"], maxResults=max_results)
+        .execute()
+    )
+    ids = resp.get("messages", [])
+    messages: List[Dict] = []
+    for msg in ids:
+        detail = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=msg["id"],
+                format="metadata",
+                metadataHeaders=["From", "Subject", "Date"],
+            )
+            .execute()
+        )
+        headers = detail.get("payload", {}).get("headers", [])
+        header_map = {h["name"]: h["value"] for h in headers}
+        messages.append(
+            {
+                "id": msg["id"],
+                "threadId": detail.get("threadId"),
+                "from": header_map.get("From", ""),
+                "subject": header_map.get("Subject", ""),
+                "snippet": detail.get("snippet", ""),
+                "internalDate": detail.get("internalDate"),
+            }
+        )
+    return messages
+
+
+def mark_messages_unread(message_ids: List[str]) -> Dict[str, Any]:
+    if not message_ids:
+        return {"success": True, "action": "mark_messages_unread", "details": {"requested": 0, "updated": 0}}
+    service = _load_gmail_service()
+    body = {"addLabelIds": ["UNREAD"], "ids": message_ids}
+    service.users().messages().batchModify(userId="me", body=body).execute()
+    logger.info("[EmailMarkUnread] Requested mark-unread for %d messages", len(message_ids))
+    return {
+        "success": True,
+        "action": "mark_messages_unread",
+        "details": {"requested": len(message_ids), "updated": len(message_ids), "ids": message_ids},
+    }
+
+
+def archive_messages(message_ids: List[str]) -> Dict[str, Any]:
+    if not message_ids:
+        return {"success": True, "action": "archive_messages", "details": {"requested": 0, "archived": 0}}
+    service = _load_gmail_service()
+    body = {"removeLabelIds": ["INBOX"], "ids": message_ids}
+    service.users().messages().batchModify(userId="me", body=body).execute()
+    logger.info("[EmailArchive] Archived %d messages", len(message_ids))
+    return {
+        "success": True,
+        "action": "archive_messages",
+        "details": {"requested": len(message_ids), "archived": len(message_ids), "ids": message_ids},
+    }
+
+
+def delete_messages(message_ids: List[str]) -> Dict[str, Any]:
+    if not message_ids:
+        return {"success": True, "action": "delete_messages", "details": {"requested": 0, "deleted": 0}}
+    service = _load_gmail_service()
+    body = {"ids": message_ids}
+    resp = service.users().messages().batchDelete(userId="me", body=body).execute()
+    logger.info("[EmailDelete] Deleted %d messages", len(message_ids))
+    return {
+        "success": True,
+        "action": "delete_messages",
+        "details": {"requested": len(message_ids), "deleted": len(message_ids), "response": resp, "ids": message_ids},
+    }
+
+
+def apply_label(message_ids: List[str], label_name: str) -> Dict[str, Any]:
+    if not message_ids:
+        return {"success": True, "action": "apply_label", "details": {"requested": 0, "updated": 0}}
+    service = _load_gmail_service()
+    # Ensure label exists (create if missing)
+    label_id = None
+    labels_resp = service.users().labels().list(userId="me").execute()
+    for lbl in labels_resp.get("labels", []):
+        if lbl.get("name") == label_name:
+            label_id = lbl.get("id")
+            break
+    if not label_id:
+        created = service.users().labels().create(userId="me", body={"name": label_name}).execute()
+        label_id = created.get("id")
+    body = {"addLabelIds": [label_id], "ids": message_ids}
+    service.users().messages().batchModify(userId="me", body=body).execute()
+    logger.info("[EmailLabel] Applied label '%s' to %d messages", label_name, len(message_ids))
+    return {
+        "success": True,
+        "action": "apply_label",
+        "details": {"requested": len(message_ids), "updated": len(message_ids), "label": label_name, "ids": message_ids},
+    }
+
+
+def send_email(to: str, subject: str, body: str, cc: Optional[List[str]] = None, bcc: Optional[List[str]] = None) -> Dict[str, Any]:
+    service = _load_gmail_service()
+    msg = MIMEMultipart()
+    msg["To"] = to
+    msg["Subject"] = subject
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    msg.attach(MIMEText(body, "plain"))
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    try:
+        resp = service.users().messages().send(userId="me", body={"raw": raw}).execute()
+        logger.info("[EmailSend] Sent email to %s subject=%s id=%s", to, subject, resp.get("id"))
+        return {
+            "success": True,
+            "action": "send_email",
+            "details": {"id": resp.get("id"), "to": to, "subject": subject, "cc": cc or [], "bcc": bcc or []},
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[EmailSend] Failed to send email: %s", exc)
+        return {"success": False, "action": "send_email", "details": {"error": str(exc), "to": to, "subject": subject}}
+
+
+def mark_inbox_unread(filter_since: Optional[datetime] = None, max_items: int = 500) -> Dict:
+    """
+    Mark unread inbox messages as read. If filter_since is provided, only messages after that timestamp.
+    Returns structured result with counts.
+    """
+    service = _load_gmail_service()
+    parts = ["in:inbox", "is:unread"]
+    if filter_since:
+        if filter_since.tzinfo is None:
+            filter_since = filter_since.replace(tzinfo=timezone.utc)
+        ts = int(filter_since.timestamp())
+        parts.append(f"after:{ts}")
+    query = " ".join(parts)
+    messages: List[Dict] = []
+    page_token = None
+    while True:
+        resp = (
+            service.users()
+            .messages()
+            .list(userId="me", q=query, maxResults=min(max_items, 500), pageToken=page_token)
+            .execute()
+        )
+        ids = resp.get("messages", [])
+        messages.extend(ids)
+        page_token = resp.get("nextPageToken")
+        if not page_token or len(messages) >= max_items:
+            break
+
+    message_ids = [m["id"] for m in messages[:max_items]]
+    count = 0
+    try:
+        if message_ids:
+            body = {"removeLabelIds": ["UNREAD"], "ids": message_ids}
+            service.users().messages().batchModify(userId="me", body=body).execute()
+            count = len(message_ids)
+            logger.info("[EmailMarkReadBulk] Marked %d inbox messages as read (query=%s)", count, query)
+        else:
+            logger.info("[EmailMarkReadBulk] No matching inbox messages for query=%s", query)
+        return {
+            "success": True,
+            "action": "mark_all_read",
+            "scope": "inbox",
+            "filter": "after_ts" if filter_since else "all_unread",
+            "requested": len(message_ids),
+            "marked": count,
+            "query": query,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[EmailMarkReadBulk] Failed to mark messages read: %s", exc)
+        return {
+            "success": False,
+            "action": "mark_all_read",
+            "scope": "inbox",
+            "filter": "after_ts" if filter_since else "all_unread",
+            "requested": len(message_ids),
+            "marked": count,
+            "error": str(exc),
+            "query": query,
+        }
 
 
 def search_messages_by_criteria(

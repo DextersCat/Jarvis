@@ -113,6 +113,7 @@ class JARVISWebSocketServer:
         self.whisper_model = None  # C4.B: Local GPU Whisper
         self.executor = ThreadPoolExecutor(max_workers=2)  # C4.D
         self.active_connections = set()
+        self.connection_ctx = {}
         
         # Audio configuration
         self.sample_rate = 16000
@@ -172,6 +173,25 @@ class JARVISWebSocketServer:
         except asyncio.CancelledError:
             link_logger.info("[HEARTBEAT] Ping loop cancelled link=%s", connection_id)
             raise
+
+    async def _heartbeat_status(self, websocket, connection_id: str, stop_event: asyncio.Event, message: str) -> None:
+        """Application-level heartbeat while working on long tasks."""
+        try:
+            while not stop_event.is_set():
+                await asyncio.sleep(10)
+                if stop_event.is_set():
+                    break
+                payload = {
+                    "type": "status",
+                    "stage": "working",
+                    "message": message,
+                }
+                await websocket.send(json.dumps(payload))
+                logger.debug("[LINK %s] Sent heartbeat status: %s", connection_id, message)
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning("[LINK %s] Heartbeat stopped (connection closed: %s %s)", connection_id, e.code, e.reason)
+        except Exception:
+            logger.exception("[LINK %s] Heartbeat task encountered an unexpected error", connection_id)
     def initialize_brain(self):
         """Initialize JARVIS brain, OpenAI client, and Whisper model"""
         try:
@@ -220,6 +240,13 @@ class JARVISWebSocketServer:
         link_logger.info("[LINK %s] Connected client=%s path=%s", connection_id, client_addr, path)
         link_logger.info("[LINK %s] handshake start", connection_id)
         self.active_connections.add(websocket)
+        self.connection_ctx[connection_id] = {
+            "state": "ready",
+            "current_task_id": None,
+            "busy_reason": None,
+            "heartbeat_task": None,
+            "heartbeat_stop_event": None,
+        }
         self._enable_tcp_keepalive(websocket, connection_id)
         ping_task = None
         try:
@@ -325,11 +352,55 @@ class JARVISWebSocketServer:
                                 'message': 'No text provided'
                             }))
                             continue
-                        response_payload = await self.brain.process_text_input(text)
-                        response_text = response_payload.get("spoken_text") if isinstance(response_payload, dict) else response_payload
-                        response_text = response_text or ""
-                        logger.info(f"JARVIS response: '{response_text}'")
-                        await self.send_tts_audio(websocket, response_text, connection_id)
+                        ctx = self.connection_ctx.get(connection_id, {})
+                        if ctx.get("state") == "busy":
+                            await websocket.send(json.dumps({
+                                "type": "status",
+                                "stage": "busy",
+                                "message": "I'm still working on your previous request, Sir. I'll be ready for the next one in a moment."
+                            }))
+                            logger.info("[LINK %s] Ignoring new chat while BUSY; still handling task %s", connection_id, ctx.get("current_task_id"))
+                            continue
+
+                        task_id = uuid.uuid4().hex[:6]
+                        ctx["state"] = "busy"
+                        ctx["current_task_id"] = task_id
+                        ctx["busy_reason"] = "chat"
+                        ctx["heartbeat_stop_event"] = None
+                        ctx["heartbeat_task"] = None
+
+                        stop_event = asyncio.Event()
+                        ctx["heartbeat_stop_event"] = stop_event
+                        initial_msg = "Working on your request, Sir. This may take a few seconds."
+                        ctx["heartbeat_task"] = asyncio.create_task(
+                            self._heartbeat_status(websocket, connection_id, stop_event, initial_msg)
+                        )
+                        try:
+                            response_payload = await self.brain.process_text_input(text)
+                            response_text = response_payload.get("spoken_text") if isinstance(response_payload, dict) else response_payload
+                            response_text = response_text or ""
+                            logger.info(f"JARVIS response: '{response_text}'")
+                            await self.send_tts_audio(websocket, response_text, connection_id)
+                        except Exception as exc:
+                            logger.error("[LINK %s] Error processing chat: %s", connection_id, exc, exc_info=True)
+                            await websocket.send(json.dumps({
+                                "type": "error",
+                                "message": f"Error processing chat: {exc}"
+                            }))
+                        finally:
+                            if ctx.get("heartbeat_stop_event"):
+                                ctx["heartbeat_stop_event"].set()
+                            ctx["state"] = "ready"
+                            ctx["current_task_id"] = None
+                            ctx["busy_reason"] = None
+                            ctx["heartbeat_stop_event"] = None
+                            ctx["heartbeat_task"] = None
+                            ready_payload = {
+                                "type": "ready",
+                                "message": "Complete. Ready for the next message."
+                            }
+                            await websocket.send(json.dumps(ready_payload))
+                            logger.info("[LINK %s] Task %s complete; link ready for next message", connection_id, task_id)
 
                     elif msg_type == "followup_choice":
                         choices = data.get("choices") or []
@@ -391,6 +462,7 @@ class JARVISWebSocketServer:
                 with contextlib.suppress(Exception):
                     await ping_task
             self.active_connections.discard(websocket)
+            self.connection_ctx.pop(connection_id, None)
             elapsed = time.time() - session_start
             logger.info(f"Connection closed: {client_addr}")
             link_logger.info("[LINK %s] Session closed after %.2fs", connection_id, elapsed)
@@ -569,45 +641,36 @@ class JARVISWebSocketServer:
                 chunk_size,
                 chunk_count,
             )
-            
-            for i in range(0, len(pcm_audio), chunk_size):
-                chunk = pcm_audio[i:i+chunk_size]
-                chunk_b64 = base64.b64encode(chunk).decode('utf-8')
-                try:
-                    await websocket.send(json.dumps({
-                        'type': 'tts_chunk',
-                        'data': chunk_b64
-                    }))
-                except Exception as exc:  # noqa: BLE001
-                    link_logger.error(
-                        "[LINK %s] ERROR during send (chunk): %s: %s",
-                        connection_id or "unknown",
-                        exc.__class__.__name__,
-                        exc,
-                    )
-                    raise
 
-                total_sent += len(chunk)
-                logger.debug(f"Sent TTS chunk: {len(chunk)} bytes")
-            
-            # Send end marker
             try:
+                for i in range(0, len(pcm_audio), chunk_size):
+                    chunk = pcm_audio[i:i+chunk_size]
+                    chunk_b64 = base64.b64encode(chunk).decode('utf-8')
+                    payload = {'type': 'tts_chunk', 'data': chunk_b64}
+                    await websocket.send(json.dumps(payload))
+                    total_sent += len(chunk)
+                    logger.debug(f"Sent TTS chunk: {len(chunk)} bytes")
+
                 await websocket.send(json.dumps({'type': 'tts_end'}))
-            except Exception as exc:  # noqa: BLE001
-                link_logger.error(
-                    "[LINK %s] ERROR during send (tts_end): %s: %s",
+                logger.info(f"TTS streaming complete: {total_sent} bytes sent")
+                link_logger.info(
+                    "[LINK %s] TTS streaming complete bytes=%d chunks=%d",
                     connection_id or "unknown",
-                    exc.__class__.__name__,
-                    exc,
+                    total_sent,
+                    chunk_count,
                 )
-                raise
-            logger.info(f"TTS streaming complete: {total_sent} bytes sent")
-            link_logger.info(
-                "[LINK %s] TTS streaming complete bytes=%d chunks=%d",
-                connection_id or "unknown",
-                total_sent,
-                chunk_count,
-            )
+            except websockets.exceptions.ConnectionClosed as e:
+                link_logger.error(
+                    "[LINK %s] TTS stream aborted after %d bytes; connection closed (%s: %s)",
+                    connection_id or "unknown",
+                    total_sent,
+                    getattr(e, "code", None),
+                    getattr(e, "reason", None),
+                )
+                return
+            except Exception:
+                link_logger.exception("[LINK %s] Unexpected error while streaming TTS audio", connection_id or "unknown")
+                return
             
         except Exception as e:
             logger.error(f"TTS error: {e}", exc_info=True)
@@ -646,8 +709,8 @@ class JARVISWebSocketServer:
         cleanup_old_logs(log_dir, hours=72)
 
         server_kwargs = {
-            "ping_interval": None,  # manual heartbeat loop
-            "ping_timeout": None,
+            "ping_interval": 20,
+            "ping_timeout": 20,
             "close_timeout": 15,
             "max_queue": None,
         }

@@ -3,30 +3,21 @@ import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from typing import Any
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
+from typing import Any, Dict
 from googleapiclient.errors import HttpError
+from services import google_helper
 
 logger = logging.getLogger(__name__)
 
-TOKEN_DIR = Path.home() / ".jarvis_tokens"
-CALENDAR_TOKEN_FILE = TOKEN_DIR / "calendar_token.json"
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 DEFAULT_TZ = "Europe/London"
 
 
 def _load_calendar_service() -> object:
-    if not CALENDAR_TOKEN_FILE.exists():
-        raise FileNotFoundError(f"Calendar token missing: {CALENDAR_TOKEN_FILE}")
-    creds = Credentials.from_authorized_user_file(str(CALENDAR_TOKEN_FILE), SCOPES)
-    if not creds.valid:
-        if creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            raise RuntimeError("Calendar credentials invalid; please re-authenticate.")
-    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+    logger.info("Calendar requested scopes: %s", SCOPES)
+    return google_helper.build_service("calendar")
 
 
 def _time_window_for_day(day_offset: int = 0) -> Tuple[str, str]:
@@ -155,3 +146,96 @@ def write_calendar_briefing(file_service, day_label: str, events: List[Dict]) ->
         return result.get("full_path")
     logger.warning("Failed to write calendar briefing: %s", result.get("message"))
     return None
+
+
+def create_event(event_spec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create an event in the primary calendar.
+    event_spec keys: title, start (datetime), end (datetime or None), all_day (bool), description, location, timezone.
+    """
+    service = google_helper.build_service("calendar")
+    summary = event_spec.get("title") or "Untitled"
+    description = event_spec.get("description") or "Created by Jarvis."
+    location = event_spec.get("location")
+    all_day = bool(event_spec.get("all_day"))
+    tz = event_spec.get("timezone") or DEFAULT_TZ
+    start_dt = event_spec.get("start")
+    end_dt = event_spec.get("end")
+
+    if not start_dt:
+        raise ValueError("Event start time is required.")
+
+    def _ensure_tz(dt):
+        if hasattr(dt, "tzinfo") and dt.tzinfo:
+            return dt
+        return dt.replace(tzinfo=timezone.utc)
+
+    body: Dict[str, Any] = {
+        "summary": summary,
+        "description": description,
+    }
+
+    if all_day:
+        start_date = start_dt.date()
+        end_date = end_dt.date() if end_dt else (start_date + timedelta(days=1))
+        body["start"] = {"date": start_date.isoformat()}
+        body["end"] = {"date": end_date.isoformat()}
+    else:
+        start_dt = _ensure_tz(start_dt)
+        if not end_dt:
+            end_dt = start_dt + timedelta(minutes=60)
+        else:
+            end_dt = _ensure_tz(end_dt)
+        body["start"] = {"dateTime": start_dt.isoformat(), "timeZone": tz}
+        body["end"] = {"dateTime": end_dt.isoformat(), "timeZone": tz}
+
+    if location:
+        body["location"] = location
+
+    try:
+        logger.info("[CalendarCreate] Inserting event summary=%s start=%s end=%s all_day=%s",
+                    summary, body.get("start"), body.get("end"), all_day)
+        event = service.events().insert(calendarId="primary", body=body).execute()
+        return {
+            "success": True,
+            "id": event.get("id"),
+            "summary": event.get("summary"),
+            "start": event.get("start"),
+            "end": event.get("end"),
+            "htmlLink": event.get("htmlLink"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[CalendarCreate] Failed to create event: %s", exc)
+        return {"success": False, "error": str(exc)}
+
+
+def update_event(event_id: str, patch: Dict[str, Any]) -> Dict[str, Any]:
+    service = google_helper.build_service("calendar")
+    try:
+        event = service.events().patch(calendarId="primary", eventId=event_id, body=patch).execute()
+        logger.info("[CalendarUpdate] Updated event id=%s summary=%s", event_id, event.get("summary"))
+        return {
+            "success": True,
+            "action": "update_event",
+            "details": {
+                "id": event.get("id"),
+                "summary": event.get("summary"),
+                "start": event.get("start"),
+                "end": event.get("end"),
+                "htmlLink": event.get("htmlLink"),
+            },
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[CalendarUpdate] Failed to update event %s: %s", event_id, exc)
+        return {"success": False, "action": "update_event", "details": {"id": event_id, "error": str(exc)}}
+
+
+def delete_event(event_id: str) -> Dict[str, Any]:
+    service = google_helper.build_service("calendar")
+    try:
+        service.events().delete(calendarId="primary", eventId=event_id).execute()
+        logger.info("[CalendarDelete] Deleted event id=%s", event_id)
+        return {"success": True, "action": "delete_event", "details": {"id": event_id}}
+    except Exception as exc:  # noqa: BLE001
+        logger.error("[CalendarDelete] Failed to delete event %s: %s", event_id, exc)
+        return {"success": False, "action": "delete_event", "details": {"id": event_id, "error": str(exc)}}

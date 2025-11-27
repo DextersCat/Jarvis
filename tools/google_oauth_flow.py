@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 import os
 from urllib.parse import urlparse, parse_qs
+from datetime import datetime, timezone
 
 from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -52,10 +53,18 @@ def run_flow(service: str, credentials_file: Path):
     if not code_list:
         raise SystemExit("No 'code' found in redirect URL. Please try again.")
     code = code_list[0]
-    creds = flow.fetch_token(code=code)
+    flow.fetch_token(code=code)
     creds = flow.credentials
-    token_path.write_text(creds.to_json())
-    print(f"[{service}] Saved token to {token_path}")
+    now = datetime.now(timezone.utc)
+    expiry = getattr(creds, "expiry", None)
+    if expiry and expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if expiry and expiry <= now:
+        raise SystemExit(
+            f"[{service}] Refusing to save token because expiry <= now (expiry={expiry.isoformat()}, now={now.isoformat()})"
+        )
+    token_path.write_text(creds.to_json(), encoding="utf-8")
+    print(f"[{service}] Saved token to {token_path} (expiry={expiry.isoformat() if expiry else 'None'})")
 
 
 def main():

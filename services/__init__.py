@@ -8,6 +8,13 @@ from .email_service import (
     build_email_markdown,
     search_messages_in_window,
     mark_messages_read,
+    mark_messages_read_action,
+    mark_messages_unread,
+    archive_messages,
+    delete_messages,
+    apply_label,
+    send_email,
+    mark_inbox_unread,
     search_messages_by_criteria,
     fetch_full_message,
     send_reply,
@@ -18,7 +25,21 @@ from .calendar_service import (
     get_next_important_event,
     write_calendar_briefing,
     build_daily_markdown,
+    create_event,
+    update_event,
+    delete_event,
 )
+from .tasks_service import (
+    list_tasks,
+    create_task,
+    update_task,
+    complete_task,
+    delete_task,
+)
+from .docs_service import create_doc, append_to_doc
+from .sheets_service import create_sheet, append_row
+from .slides_service import create_presentation, add_title_slide
+from .drive_service import find_file, rename_file, move_file, delete_file
 
 __all__ = [
     "search_web",
@@ -29,6 +50,13 @@ __all__ = [
     "build_email_markdown",
     "search_messages_in_window",
     "mark_messages_read",
+    "mark_messages_read_action",
+    "mark_messages_unread",
+    "archive_messages",
+    "delete_messages",
+    "apply_label",
+    "send_email",
+    "mark_inbox_unread",
     "search_messages_by_criteria",
     "fetch_full_message",
     "send_reply",
@@ -37,4 +65,22 @@ __all__ = [
     "get_next_important_event",
     "write_calendar_briefing",
     "build_daily_markdown",
+    "create_event",
+    "update_event",
+    "delete_event",
+    "list_tasks",
+    "create_task",
+    "update_task",
+    "complete_task",
+    "delete_task",
+    "create_doc",
+    "append_to_doc",
+    "create_sheet",
+    "append_row",
+    "create_presentation",
+    "add_title_slide",
+    "find_file",
+    "rename_file",
+    "move_file",
+    "delete_file",
 ]
