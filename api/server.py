@@ -709,8 +709,8 @@ class JARVISWebSocketServer:
         cleanup_old_logs(log_dir, hours=72)
 
         server_kwargs = {
-            "ping_interval": 20,
-            "ping_timeout": 20,
+            "ping_interval": None,
+            "ping_timeout": None,
             "close_timeout": 15,
             "max_queue": None,
         }
