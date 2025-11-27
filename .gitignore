@@ -36,3 +36,4 @@ voice_assets/
 
 # Local overrides
 .env
+config/.env
