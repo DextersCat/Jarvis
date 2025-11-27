@@ -204,6 +204,15 @@ class JarvisLite:
             self.add_event(f"HUD reply options forward error: {e}")
 
     async def forward_hud_panel_update(self, payload):
+        payload_dict = payload if isinstance(payload, dict) else {}
+        logger.info(
+            "[HUD] Forwarding panel update: panel=%s mode=%s source=%s items_len=%s has_markdown=%s",
+            payload_dict.get("panel"),
+            payload_dict.get("mode"),
+            payload_dict.get("source"),
+            len(payload_dict.get("items") or []),
+            bool(payload_dict.get("markdown")),
+        )
         if not isinstance(payload, dict):
             self.add_event("[HUD] hud_panel_update payload ignored (not a dict)")
             return
@@ -239,12 +248,14 @@ class JarvisLite:
         )
         try:
             async with aiohttp.ClientSession() as session:
-                await session.post(
+                async with session.post(
                     "http://localhost:5000/api/jarvis/hud-panel-update",
                     json=hud_payload,
                     timeout=aiohttp.ClientTimeout(total=3)
-                )
+                ) as resp:
+                    logger.info("[HUD] HUD API response: status=%s", resp.status)
         except Exception as e:
+            logger.warning("[HUD] HUD forward failed: %s", e)
             self.add_event(f"HUD panel update forward error: {e}")
 
     def log_aipi(self, message):
@@ -470,6 +481,12 @@ class JarvisLite:
 
                         async for msg in ws:
                             data = json.loads(msg)
+                            if isinstance(data, dict) and "type" in data:
+                                logger.info(
+                                    "[HUD] Incoming message type=%s keys=%s",
+                                    data.get("type"),
+                                    sorted(data.keys())
+                                )
                             if data.get('type') == 'UTTERANCE':
                                 await self.handle_utterance(data)
                             elif data.get('type') == 'tts_chunk':
