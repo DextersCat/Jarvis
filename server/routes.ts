@@ -255,5 +255,35 @@ export async function registerRoutes(app: Express): Promise<Server> {
     res.json({ success: true });
   });
 
+  app.post('/api/jarvis/hud-panel-update', (req, res) => {
+    const payload = (req.body && typeof req.body === 'object') ? req.body : {};
+    const panel = typeof payload.panel === 'string' ? payload.panel : null;
+    const mode = typeof payload.mode === 'string' ? payload.mode : null;
+    const source = typeof payload.source === 'string' ? payload.source : null;
+
+    if (!panel || !mode || !source) {
+      return res.status(400).json({ success: false, message: 'Missing panel/mode/source' });
+    }
+
+    const message: any = {
+      type: 'hud_panel_update',
+      panel,
+      mode,
+      source,
+    };
+    if (Array.isArray(payload.items)) {
+      message.items = payload.items;
+    }
+    if (typeof payload.markdown === 'string' && payload.markdown.length > 0) {
+      message.markdown = payload.markdown;
+    }
+    if (payload.meta && typeof payload.meta === 'object' && !Array.isArray(payload.meta)) {
+      message.meta = payload.meta;
+    }
+
+    broadcast(message);
+    res.json({ success: true });
+  });
+
   return httpServer;
 }

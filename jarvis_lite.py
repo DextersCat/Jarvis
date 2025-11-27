@@ -202,6 +202,51 @@ class JarvisLite:
                 )
         except Exception as e:
             self.add_event(f"HUD reply options forward error: {e}")
+
+    async def forward_hud_panel_update(self, payload):
+        if not isinstance(payload, dict):
+            self.add_event("[HUD] hud_panel_update payload ignored (not a dict)")
+            return
+        panel = payload.get("panel")
+        mode = payload.get("mode")
+        source = payload.get("source")
+        missing = [name for name, value in (("panel", panel), ("mode", mode), ("source", source)) if not value]
+        if missing:
+            self.add_event(f"[HUD] hud_panel_update missing fields: {', '.join(missing)}")
+            return
+        normalized_panel = str(panel)
+        normalized_mode = str(mode)
+        normalized_source = str(source)
+        hud_payload = {
+            "type": "hud_panel_update",
+            "panel": normalized_panel,
+            "mode": normalized_mode,
+            "source": normalized_source,
+        }
+        raw_items = payload.get("items")
+        items = raw_items if isinstance(raw_items, list) else None
+        if items is not None:
+            hud_payload["items"] = items
+        markdown = payload.get("markdown")
+        if isinstance(markdown, str) and markdown:
+            hud_payload["markdown"] = markdown
+        meta = payload.get("meta")
+        if isinstance(meta, dict) and meta:
+            hud_payload["meta"] = meta
+        item_count = len(items) if items is not None else 0
+        self.add_event(
+            f"[HUD] panel={normalized_panel} mode={normalized_mode} source={normalized_source} items={item_count}"
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                await session.post(
+                    "http://localhost:5000/api/jarvis/hud-panel-update",
+                    json=hud_payload,
+                    timeout=aiohttp.ClientTimeout(total=3)
+                )
+        except Exception as e:
+            self.add_event(f"HUD panel update forward error: {e}")
+
     def log_aipi(self, message):
         self.add_event(f"[AiPi] {message}")
 
@@ -434,6 +479,8 @@ class JarvisLite:
                             elif data.get('type') == 'updateReplyOptions':
                                 self.log_aipi(f"Forwarding reply options {data.get('question_id')}")
                                 asyncio.create_task(self.forward_reply_options(data))
+                            elif data.get('type') == 'hud_panel_update':
+                                asyncio.create_task(self.forward_hud_panel_update(data))
             except Exception as e:
                 if self.connected:
                     self.add_event("⚠️ Neural Link Lost")
