@@ -122,7 +122,13 @@ class JARVISWebSocketServer:
     async def start_server(self):
         self.initialize_brain()
         # ... (startup logs)
-        async with websockets.serve(self.handle_client, self.host, self.port):
+        async with websockets.serve(
+            self.handle_client,
+            self.host,
+            self.port,
+            ping_interval=30,
+            ping_timeout=None,
+        ):
             await asyncio.Future()
 
 async def main():

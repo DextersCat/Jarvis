@@ -74,7 +74,7 @@ class AstraMeaningNormalizer:
                 "parameters": {},
             }
 
-        intent = self._parse_intent_text(text)
+        intent = self._parse_intent_text(text, safe_text)
         if self._sample_logs < self.SAMPLE_LOG_LIMIT:
             logger.info("[Normalizer] Sample intent: raw='%s' -> %s", safe_text[:80], intent)
             self._sample_logs += 1
@@ -86,7 +86,7 @@ class AstraMeaningNormalizer:
             "You normalize noisy voice transcription into a minimal intent JSON.\n"
             "Respond ONLY with a JSON object, no prose.\n"
             "Constraints:\n"
-            "- Domains allowed: email, web_search, calendar, general_task, clarify\n"
+            "- Domains allowed: email, web_search, calendar, memory, docs, local_docs, system, general_task, clarify\n"
             "- Actions allowed: search, summarize, create, update, delete, query, none\n"
             "- NEVER fabricate email content; you only extract intent/queries.\n"
             "- If confidence < 0.4, set domain='clarify' and include a clarifying question.\n"
@@ -112,21 +112,13 @@ class AstraMeaningNormalizer:
         )
 
     @staticmethod
-    def _parse_intent_text(text: str) -> Dict[str, Any]:
+    def _parse_intent_text(text: str, fallback_text: str | None = None) -> Dict[str, Any]:
         import json
 
-        default_intent = {
-            "domain": "clarify",
-            "question": "Sir, what exactly would you like me to do?",
-            "confidence": 0.0,
-            "fuzzy_allowed": False,
-            "parameters": {},
-            "search_term": "",
-            "action": "none",
-        }
+        default_intent = AstraMeaningNormalizer._default_intent()
 
         if not text:
-            return default_intent
+            return AstraMeaningNormalizer._heuristic_intent_from_text(fallback_text or "")
         try:
             obj = json.loads(text)
             domain = obj.get("domain") or "clarify"
@@ -138,7 +130,17 @@ class AstraMeaningNormalizer:
             question = obj.get("question") or default_intent["question"]
 
             # Clamp domain to allowed set
-            if domain not in {"email", "web_search", "calendar", "general_task", "clarify"}:
+            if domain not in {
+                "email",
+                "web_search",
+                "calendar",
+                "memory",
+                "docs",
+                "local_docs",
+                "system",
+                "general_task",
+                "clarify",
+            }:
                 domain = "clarify"
 
             if confidence < 0.0 or confidence > 1.0:
@@ -160,4 +162,53 @@ class AstraMeaningNormalizer:
             return intent
         except Exception as exc:  # noqa: BLE001
             logger.warning("[Normalizer] Failed to parse intent JSON: %s", exc)
-            return default_intent
+            return AstraMeaningNormalizer._heuristic_intent_from_text(fallback_text or "")
+
+    @staticmethod
+    def _default_intent() -> Dict[str, Any]:
+        return {
+            "domain": "clarify",
+            "question": "Sir, what exactly would you like me to do?",
+            "confidence": 0.0,
+            "fuzzy_allowed": False,
+            "parameters": {},
+            "search_term": "",
+            "action": "none",
+        }
+
+    @staticmethod
+    def _heuristic_intent_from_text(raw_text: str) -> Dict[str, Any]:
+        base = AstraMeaningNormalizer._default_intent()
+        lowered = (raw_text or "").lower()
+        status_triggers = {"status", "state", "health"}
+        context_terms = {"your", "jarvis", "system", "current"}
+        if any(keyword in lowered for keyword in status_triggers) and any(ctx in lowered for ctx in context_terms):
+            base.update(
+                {
+                    "domain": "system",
+                    "action": "status",
+                    "search_term": raw_text.strip(),
+                    "confidence": 0.65,
+                    "fuzzy_allowed": False,
+                    "question": "",
+                }
+            )
+        return base
+
+    @staticmethod
+    def looks_like_web_query(text: str | None) -> bool:
+        if not text:
+            return False
+        lowered = text.lower()
+        patterns = [
+            "who is",
+            "what is",
+            "tell me about",
+            "what have they said about",
+            "latest news on",
+            "search the web for",
+            "find out",
+            "what's going on with",
+            "give me an update on",
+        ]
+        return any(pattern in lowered for pattern in patterns)

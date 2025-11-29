@@ -10,6 +10,7 @@ Based on: Fresh Professional Astra AI with JARVIS Personality Framework
 """
 
 import asyncio
+import inspect
 import logging
 import os
 import platform
@@ -18,14 +19,10 @@ import re
 import socket
 import sys
 import uuid
-from typing import Optional
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
-
-import inspect
-import uuid
-from typing import Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -53,6 +50,12 @@ from file_service import JarvisFileService
 from services.search_service import search_web, summarise_search_results
 from services import google_helper
 from agents.email_agent import EmailAgent
+from agents.web_search_agent import WebSearchAgent
+from agents.memory_agent import MemoryAgent
+from agents.calendar_agent import CalendarAgent
+from agents.docs_agent import DocsAgent
+from agents.local_docs_agent import LocalDocsSearchAgent
+from agents.system_agent import SystemAgent
 from services.email_service import (
     fetch_unread_summary,
     write_email_summary,
@@ -100,6 +103,9 @@ logger = logging.getLogger(__name__)
 LONG_QUERY_THRESHOLD = 350
 SPOKEN_LENGTH_WATERMARK = 1200
 MAX_CHAT_TOKENS = 200
+MAX_EMAIL_SEARCH_HISTORY = 24
+MAX_WEB_SEARCH_HISTORY = 24
+HUD_FOLLOWUP_DOMAINS = {"email", "web_search", "calendar", "docs", "memory", "system"}
 
 class JARVISBrain:
     """
@@ -141,12 +147,20 @@ class JARVISBrain:
             "awaiting_followup": False,
             "last_question_id": None,
         }
-        self.active_question_id = None
+        self.active_followup_question_id = None
         self.pending_choices = {}
+        self._pending_email_search_results: dict[str, list[dict[str, Any]]] = {}
+        self._pending_email_reply_drafts: dict[str, dict[str, Any]] = {}
+        self._last_email_focus: dict[str, Any] | None = None
+        self._pending_web_search_results: dict[str, list[dict[str, Any]]] = {}
+        self.current_web_result: dict[str, Any] | None = None
+        self._last_web_focus: dict[str, Any] | None = None
+        self._pending_web_reply_refresh: dict[str, Any] | None = None
         self.pending_mark_read = None
         self.current_email = None
         self.current_email_identity = None
         self.pending_reply = None
+        self.email_edit_context: dict[str, Any] | None = None
         self.email_agent = EmailAgent()
         self.meaning_normalizer = None
 
@@ -383,27 +397,55 @@ class JARVISBrain:
         if not choices:
             logger.warning("[FOLLOWUP] Empty choices list for question_id=%s", question_id)
             return "I didn't receive which option you wanted, Sir."
-        if self.active_question_id and question_id != self.active_question_id:
+        if self.active_followup_question_id and question_id != self.active_followup_question_id:
             logger.warning(
                 "[FOLLOWUP] Received choice for stale question_id=%s (active=%s)",
                 question_id,
-                self.active_question_id,
+                self.active_followup_question_id,
             )
             return "That follow-up is no longer active, Sir."
 
-        payload = self.pending_choices.get(question_id)
-        if payload and payload.get("handler") == "email_bulk_mark_read":
-            result = await self._handle_email_bulk_followup(payload, choices)
-        elif payload and payload.get("handler") == "calendar_delete_event":
-            result = await self._handle_calendar_delete_followup(payload, choices)
-        elif payload and payload.get("handler") == "email_delete":
-            result = await self._handle_email_delete_followup(payload, choices)
+        preserve_reply_options = False
+        result = None
+        first_choice = choices[0] if choices else None
+        email_actions = ("open_email", "summarise_email", "search_docs_from_email")
+        web_actions = ("open_web_result", "summarise_web_result", "search_docs_from_web_result")
+        if first_choice in email_actions:
+            preserve_reply_options = True
+            result = await self._handle_email_hud_followup(question_id, choices)
+        elif first_choice in web_actions:
+            preserve_reply_options = True
+            result = await self._handle_web_hud_followup(question_id, choices)
+        elif question_id in self._pending_email_search_results:
+            preserve_reply_options = True
+            result = await self._handle_email_search_selection(question_id, choices)
+        elif question_id in self._pending_web_search_results:
+            preserve_reply_options = True
+            result = await self._handle_web_search_selection(question_id, choices)
+        elif question_id in self._pending_email_reply_drafts:
+            result = await self._handle_email_reply_choice(question_id, choices)
         else:
-            result = await self._process_followup_prompt(question_id, choices)
+            payload = self.pending_choices.get(question_id)
+            if payload and payload.get("handler") == "email_bulk_mark_read":
+                result = await self._handle_email_bulk_followup(payload, choices)
+            elif payload and payload.get("handler") == "calendar_delete_event":
+                result = await self._handle_calendar_delete_followup(payload, choices)
+            elif payload and payload.get("handler") == "email_delete":
+                result = await self._handle_email_delete_followup(payload, choices)
+            elif payload and payload.get("handler") == "web_search_followup":
+                result = await self._handle_web_search_followup(payload, choices)
+            elif payload and payload.get("handler") == "email_reply_followup":
+                result = await self._handle_email_reply_followup(payload, choices)
+            else:
+                result = await self._process_followup_prompt(question_id, choices)
 
-        # Clear active question after handling
-        self.active_question_id = None
-        await self._clear_reply_options()
+        refresh_data = self._pending_web_reply_refresh
+        self._pending_web_reply_refresh = None
+        if not preserve_reply_options:
+            self.active_followup_question_id = None
+            await self._clear_reply_options(question_id)
+            if refresh_data:
+                await self._send_web_reply_options(**refresh_data)
         return result
 
     async def _emit_hud_event(self, payload: dict) -> bool:
@@ -420,7 +462,21 @@ class JARVISBrain:
             logger.warning("[HUD_ERROR] Failed to send HUD event: %s", exc)
             return False
 
-    async def _clear_reply_options(self):
+    async def _send_to_hud(self, payload: dict[str, Any]) -> bool:
+        """Wrapper around `_emit_hud_event` for clarity."""
+        return await self._emit_hud_event(payload)
+
+    async def _emit_followup_choices(self, payload: dict[str, Any], domain: str) -> bool:
+        """Emit follow-up choices only for whitelisted domains."""
+        if domain not in HUD_FOLLOWUP_DOMAINS:
+            logger.info(
+                "[HUD] Skipping reply options for domain=%s (HUD isolation active)",
+                domain,
+            )
+            return False
+        return await self._emit_hud_event(payload)
+
+    async def _clear_reply_options(self, question_id: str | None = None):
         """Clear reply options on HUD (defensive)."""
         try:
             if hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
@@ -430,9 +486,613 @@ class JARVISBrain:
                     "choices": {},
                     "topic": None,
                 })
+                logger.info("[FOLLOWUP] Clearing reply options for qid=%s", question_id or "none")
                 logger.info("[HUD] Cleared reply options")
         except Exception as exc:  # noqa: BLE001
             logger.warning("[HUD_ERROR] Failed to clear reply options: %s", exc)
+
+    def _activate_followup(self, question_id: str, topic: str | None):
+        """Record the current follow-up and keep HUD logs in sync."""
+        self.active_followup_question_id = question_id
+        self.conversation_state["awaiting_followup"] = True
+        self.conversation_state["last_question_id"] = question_id
+        logger.info(
+            "[FOLLOWUP] Activated followup question_id=%s topic=%s",
+            question_id,
+            topic or "unknown",
+        )
+
+    def _ensure_default_reply_options(
+        self,
+        query_id: str | None,
+        reply_options: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """
+        Guarantee that HUD reply options are non-empty and include a default end-query option.
+        """
+        options = list(reply_options or [])
+        if options:
+            return options
+        default_option = {
+            "id": "end_query",
+            "label": "End this query",
+            "kind": "core",
+            "action": "cancel",
+        }
+        if query_id:
+            default_option["query_id"] = query_id
+        options.append(default_option)
+        return options
+
+    def _prepare_hud_payload(
+        self,
+        payload: dict[str, Any],
+        query_id: str | None,
+        reply_options: list[dict[str, Any]] | None = None,
+        reset_hud: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Clone the HUD payload and ensure it carries reply options + optional reset flag.
+        """
+        enriched = dict(payload)
+        if "metadata" in enriched and isinstance(enriched["metadata"], dict):
+            enriched["metadata"] = dict(enriched["metadata"])
+
+        existing_options = enriched.pop("reply_options", None) or []
+        merged_options = []
+        if isinstance(existing_options, list):
+            merged_options.extend(existing_options)
+        else:
+            merged_options.append(existing_options)
+        if reply_options:
+            merged_options.extend(reply_options)
+        enriched["reply_options"] = self._ensure_default_reply_options(query_id, merged_options)
+        if reset_hud:
+            enriched["reset_hud"] = True
+        return enriched
+
+    async def _send_hud_panel(
+        self,
+        payload: dict[str, Any],
+        *,
+        query_id: str | None = None,
+        reply_options: list[dict[str, Any]] | None = None,
+        reset_hud: bool = False,
+    ) -> bool:
+        """
+        Emit a HUD panel update payload with consistent reply options and reset flag.
+        """
+        enriched = self._prepare_hud_payload(payload, query_id, reply_options=reply_options, reset_hud=reset_hud)
+        return await self._emit_hud_event(enriched)
+
+    async def _send_panel_reset(self, query_id: str | None = None):
+        """Reset HUD focus/context panels and reply options before handling a new query."""
+        if not hasattr(self, "hud_event_sink") or not callable(self.hud_event_sink):
+            return
+
+        metadata_base = {"reset": True}
+        if query_id:
+            metadata_base["query_id"] = query_id
+
+        focus_payload = {
+            "type": "hud_panel_update",
+            "panel": "focus",
+            "mode": "list",
+            "source": "brain",
+            "title": "",
+            "items": [],
+            "metadata": dict(metadata_base),
+        }
+        context_payload = {
+            "type": "hud_panel_update",
+            "panel": "context",
+            "mode": "list",
+            "source": "brain",
+            "title": "",
+            "items": [],
+            "metadata": dict(metadata_base),
+        }
+
+        try:
+            await self._send_hud_panel(focus_payload, query_id=query_id, reset_hud=True)
+            await self._send_hud_panel(context_payload, query_id=query_id, reset_hud=True)
+            logger.info("[HUD] Panel reset for query_id=%s", query_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[HUD_ERROR] Panel reset failed: %s", exc)
+
+    async def _reset_hud_for_new_query(self, query_id: str):
+        """Clear HUD state and caches when a new query arrives."""
+        if not query_id:
+            return
+        self.active_followup_question_id = None
+        self.conversation_state["awaiting_followup"] = False
+        self.conversation_state["last_question_id"] = None
+        self.current_email = None
+        self.current_web_result = None
+        self._last_email_focus = None
+        self._last_web_focus = None
+        self._pending_web_reply_refresh = None
+        await self._clear_reply_options(query_id)
+        await self._send_hud_result_list("brain", query_id, [])
+        await self._send_panel_reset(query_id)
+
+    async def _handle_hud_clear(self):
+        """Reset HUD and cancel any active follow-ups without running agents."""
+        self.pending_choices.clear()
+        self._pending_email_search_results.clear()
+        self._pending_web_search_results.clear()
+        self.pending_mark_read = None
+        self.current_email = None
+        self.current_web_result = None
+        self._last_email_focus = None
+        self._last_web_focus = None
+        self.active_followup_question_id = None
+        self.conversation_state["awaiting_followup"] = False
+        self.conversation_state["last_question_id"] = None
+        self._pending_web_reply_refresh = None
+        query_id = self._generate_question_id()
+        await self._reset_hud_for_new_query(query_id)
+
+    async def _send_hud_result_list(
+        self,
+        source: str,
+        query_id: str,
+        items: list[dict[str, Any]],
+    ):
+        """Send a normalized result list panel update for HUD column 2."""
+        if not hasattr(self, "hud_event_sink") or not callable(self.hud_event_sink):
+            return
+        payload = {
+            "type": "hud_panel_update",
+            "panel": "context",
+            "mode": "list",
+            "source": source,
+            "title": f"{source.replace('_', ' ').title()} results",
+            "items": items,
+            "metadata": {"query_id": query_id},
+        }
+        try:
+            await self._send_hud_panel(payload, query_id=query_id)
+            logger.info("[HUD] panel=context mode=list source=%s items=%d", source, len(items))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[HUD_ERROR] Failed to send %s result list: %s", source, exc)
+
+    async def _send_focus_panel(self, query_id: str | None, query: str, focus_text: str | None):
+        if not focus_text:
+            return
+        title = f"Web search: {self._preview_text(query, 60)}" if query else "Web search"
+        payload = {
+            "type": "hud_panel_update",
+            "panel": "focus",
+            "mode": "markdown",
+            "source": "web_search",
+            "title": title,
+            "markdown": focus_text,
+            "metadata": {
+                "query": query,
+                "query_id": query_id,
+            },
+        }
+        sent = await self._send_hud_panel(payload, query_id=query_id)
+        if sent:
+            logger.info("[WebHUD] Focus sent for query_id=%s", query_id)
+
+    async def _send_context_panel(self, query_id: str | None, query: str, context_points: list[str]):
+        if not context_points:
+            return
+        title = f"Context for {self._preview_text(query, 60)}" if query else "Web context"
+        items = [{"title": point} for point in context_points[:6]]
+        payload = {
+            "type": "hud_panel_update",
+            "panel": "context",
+            "mode": "list",
+            "source": "web_search",
+            "title": title,
+            "items": items,
+            "metadata": {
+                "query": query,
+                "query_id": query_id,
+            },
+        }
+        sent = await self._send_hud_panel(payload, query_id=query_id)
+        if sent:
+            logger.info("[WebHUD] Context sent for query_id=%s", query_id)
+
+    async def _send_web_reply_options(
+        self,
+        query_id: str | None,
+        query: str,
+        topic: str,
+        style: str,
+    ):
+        if not query_id:
+            query_id = self._generate_question_id()
+        choices = {
+            "A": "Deeper dive",
+            "B": "Different angle",
+            "C": "Short recap",
+        }
+        payload = {
+            "type": "followup_choices",
+            "question_id": query_id,
+            "topic": topic,
+            "choices": choices,
+            "handler": "web_search_followup",
+            "query": query,
+            "style": style,
+            "metadata": {"query": query, "style": style},
+        }
+        self.pending_choices[query_id] = {
+            "question_id": query_id,
+            "handler": "web_search_followup",
+            "topic": topic,
+            "query": query,
+            "style": style,
+        }
+        self._activate_followup(query_id, topic)
+        sent = await self._emit_followup_choices(payload, "email")
+        if sent:
+            logger.info("[WebHUD] Followup choices A/B/C sent for query_id=%s", query_id)
+
+    def _schedule_web_reply_options(self, query_id: str | None, query: str, topic: str, style: str):
+        self._pending_web_reply_refresh = {
+            "query_id": query_id,
+            "query": query,
+            "topic": topic,
+            "style": style,
+        }
+
+    async def _send_email_focus_panel(self, query_id: str | None, email_meta: dict[str, Any]):
+        if not email_meta:
+            return
+        focus_data = self.email_agent.build_focus_payload(email_meta)
+        payload = {
+            "type": "hud_panel_update",
+            "panel": "focus",
+            "mode": "cards",
+            "source": "email",
+            "title": focus_data.get("subject"),
+            "items": [
+                {
+                    "title": focus_data.get("sender"),
+                    "subtitle": focus_data.get("snippet"),
+                    "metadata": {
+                        "timestamp": focus_data.get("timestamp"),
+                        "thread_id": focus_data.get("thread_id"),
+                        "message_id": focus_data.get("message_id"),
+                    },
+                }
+            ],
+            "metadata": {"query_id": query_id, "thread_id": focus_data.get("thread_id")},
+        }
+        if await self._send_hud_panel(payload, query_id=query_id):
+            logger.info("[EmailHUD] Focus sent for query_id=%s", query_id)
+
+    async def _send_email_context_summary(self, query_id: str | None, summary: str):
+        if not summary:
+            return
+        context_data = self.email_agent.build_context_summary(summary)
+        payload = {
+            "type": "hud_panel_update",
+            "panel": "context",
+            "mode": "list",
+            "source": "email",
+            "title": "Email summary",
+            "items": [{"title": "Summary", "subtitle": context_data.get("summary")}],
+            "metadata": {"query_id": query_id},
+        }
+        if await self._send_hud_panel(payload, query_id=query_id):
+            logger.info("[EmailHUD] Context sent for query_id=%s", query_id)
+
+    async def _send_email_context_draft(self, query_id: str | None, draft: str):
+        if not draft:
+            return
+        context_data = self.email_agent.build_context_draft(draft)
+        payload = {
+            "type": "hud_panel_update",
+            "panel": "context",
+            "mode": "markdown",
+            "source": "email",
+            "title": "Draft reply",
+            "markdown": draft,
+            "metadata": {"query_id": query_id},
+        }
+        if await self._send_hud_panel(payload, query_id=query_id):
+            logger.info("[EmailHUD] Context draft sent for query_id=%s", query_id)
+
+    async def _send_email_context_status(self, query_id: str | None, status: str):
+        if not status:
+            return
+        payload = {
+            "type": "hud_panel_update",
+            "panel": "context",
+            "mode": "list",
+            "source": "email",
+            "title": "Email status",
+            "items": [{"title": status}],
+            "metadata": {"query_id": query_id},
+        }
+        await self._send_hud_panel(payload, query_id=query_id)
+        logger.info("[EmailHUD] Context status sent for query_id=%s", query_id)
+
+    def _normalize_email_search_result(self, message: dict[str, Any]) -> dict[str, Any]:
+        """Normalise HUD-facing email search items."""
+        return {
+            "id": message.get("id"),
+            "threadId": message.get("threadId") or message.get("thread_id"),
+            "subject": message.get("subject"),
+            "from": message.get("from"),
+            "date": message.get("date"),
+            "snippet": message.get("snippet"),
+        }
+
+    def _build_email_focus_record(self, meta: dict[str, Any], body: str | None = None) -> dict[str, Any]:
+        """Create a sanitized record used for focus/context updates."""
+        normalized_body = body or meta.get("body") or ""
+        snippet = meta.get("snippet") or (normalized_body or "")[:240]
+        return {
+            "id": meta.get("id"),
+            "threadId": meta.get("threadId") or meta.get("thread_id"),
+            "from": meta.get("from"),
+            "subject": meta.get("subject") or "Email",
+            "date": meta.get("date"),
+            "body": normalized_body,
+            "snippet": snippet,
+        }
+
+    async def _activate_email_focus_from_record(self, query_id: str | None, record: dict[str, Any]):
+        """Update brain focus state and HUD panels for the provided email."""
+        if not record:
+            return
+        self.current_email = record
+        self.current_email_identity = None
+        self._last_email_focus = dict(record)
+        await self._send_email_focus_panel(query_id, record)
+        summary_text = record.get("body") or record.get("snippet") or "Summary unavailable."
+        await self._send_email_context_summary(query_id, summary_text)
+
+    async def _handle_email_hud_followup(self, question_id: str, choices: list[str]) -> str:
+        """
+        Handle HUD-level email actions (open_email, summarise_email, search_docs_from_email)
+        that operate on the currently focused email.
+        """
+        if not choices:
+            return "I didn't catch which action you wanted, Sir."
+        action = choices[0]
+        record = getattr(self, "current_email", None) or getattr(self, "_last_email_focus", None)
+        if not record:
+            return "I don't have an email in focus to work with, Sir."
+
+        subject = record.get("subject") or "that email"
+
+        if action == "open_email":
+            await self._activate_email_focus_from_record(question_id, record)
+            return f"Focused on {subject}, Sir."
+
+        if action == "summarise_email":
+            body = record.get("body") or record.get("snippet") or ""
+            if not body:
+                return "I don't have enough content from that email to summarise, Sir."
+            prompt = (
+                "Summarise this email in 2–4 sentences for voice. "
+                "Skip unsubscribe links and boilerplate. Focus on key details."
+            )
+            try:
+                completion = await asyncio.to_thread(
+                    self.openai_client.chat.completions.create,
+                    model=self.ai_model,
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {
+                            "role": "user",
+                            "content": f"Subject: {subject}\n\n{body}",
+                        },
+                    ],
+                    max_tokens=MAX_CHAT_TOKENS,
+                )
+                summary = completion.choices[0].message.content or ""
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[EmailHUD] Summarisation failed: %s", exc)
+                return "I couldn't summarise that email just now, Sir."
+            summary_text = summary.strip()
+            if not summary_text:
+                return "I couldn't summarise that email just now, Sir."
+            await self._send_email_context_summary(question_id, summary_text)
+            return f"Here's a brief summary of {subject}, Sir."
+
+        if action == "search_docs_from_email":
+            return "I haven't wired document search from this email yet, Sir, but the HUD is ready for it."
+
+        return "I couldn't interpret that follow-up action, Sir."
+
+    def _make_email_hud_reply_options(self, question_id: str, topic: str | None = None) -> dict[str, Any]:
+        """Shared payload for the email follow-up choices displayed in the HUD."""
+        topic_label = topic or f"Email follow-up {question_id[-6:]}"
+        choices = [
+            {
+                "id": "open_email",
+                "label": "Open selected email",
+                "action": "open_email",
+                "query_id": question_id,
+            },
+            {
+                "id": "summarise_email",
+                "label": "Summarise this email",
+                "action": "summarise_email",
+                "query_id": question_id,
+            },
+            {
+                "id": "search_docs_from_email",
+                "label": "Search docs for this topic",
+                "action": "search_docs_from_email",
+                "query_id": question_id,
+            },
+        ]
+        return {
+            "type": "followup_choices",
+            "question_id": question_id,
+            "query_id": question_id,
+            "topic": topic_label,
+            "choices": choices,
+        }
+
+    def _normalize_web_search_result(self, result: dict[str, Any], index: int) -> dict[str, Any]:
+        """Prepare HUD-friendly web search entries from the agent results."""
+        result_id = result.get("id") or result.get("url") or f"web-{index}"
+        title = result.get("title") or "Untitled"
+        snippet = (result.get("snippet") or "").strip()
+        return {
+            "id": result_id,
+            "title": title,
+            "url": result.get("url") or "",
+            "snippet": snippet,
+            "source": result.get("source") or "web",
+            "metadata": {"position": index},
+        }
+
+    async def _activate_web_focus_from_record(self, query_id: str | None, record: dict[str, Any]):
+        """Update HUD focus/context panels for the selected web result."""
+        if not record:
+            return
+        self.current_web_result = record
+        self._last_web_focus = dict(record)
+        focus_text = record.get("snippet") or record.get("title") or ""
+        await self._send_focus_panel(query_id, record.get("title") or "Web result", focus_text)
+        context_points = []
+        url = record.get("url")
+        if url:
+            context_points.append(f"URL: {url}")
+        if focus_text:
+            context_points.append(f"Preview: {focus_text}")
+        if context_points:
+            await self._send_context_panel(query_id, record.get("title") or "Web result", context_points)
+
+    def _make_web_hud_reply_options(self, question_id: str, topic: str | None = None) -> dict[str, Any]:
+        """Shared payload for web search follow-up choices sent to the HUD."""
+        topic_label = topic or f"Web follow-up {question_id[-6:]}"
+        choices = [
+            {
+                "id": "open_web_result",
+                "label": "Open selected result",
+                "action": "open_web_result",
+                "query_id": question_id,
+            },
+            {
+                "id": "summarise_web_result",
+                "label": "Summarise this result",
+                "action": "summarise_web_result",
+                "query_id": question_id,
+            },
+            {
+                "id": "search_docs_from_web_result",
+                "label": "Search docs for this topic",
+                "action": "search_docs_from_web_result",
+                "query_id": question_id,
+            },
+        ]
+        return {
+            "type": "followup_choices",
+            "question_id": question_id,
+            "query_id": question_id,
+            "topic": topic_label,
+            "choices": choices,
+        }
+
+    def _prune_email_search_history(self):
+        """Keep the email search result cache to a reasonable size."""
+        while len(self._pending_email_search_results) > MAX_EMAIL_SEARCH_HISTORY:
+            self._pending_email_search_results.pop(next(iter(self._pending_email_search_results)), None)
+
+    def _prune_web_search_history(self):
+        """Keep the web search result cache to a reasonable size."""
+        while len(self._pending_web_search_results) > MAX_WEB_SEARCH_HISTORY:
+            self._pending_web_search_results.pop(next(iter(self._pending_web_search_results)), None)
+
+    async def _send_email_reply_options(
+        self,
+        query_id: str | None,
+        email_meta: dict[str, Any],
+        topic: str,
+        draft: str | None = None,
+    ):
+        question_id = query_id or self._generate_question_id()
+        payload = {
+            "type": "followup_choices",
+            "question_id": question_id,
+            "topic": topic,
+            "choices": {"A": "Send reply", "B": "Edit draft", "C": "Discard"},
+            "handler": "email_reply_followup",
+            "email": {
+                "id": email_meta.get("id"),
+                "threadId": email_meta.get("threadId"),
+                "from": email_meta.get("from"),
+                "subject": email_meta.get("subject"),
+                "date": email_meta.get("date"),
+                "body": email_meta.get("body"),
+            },
+        }
+        if draft:
+            payload["draft"] = draft
+        self.pending_choices[question_id] = {
+            "question_id": question_id,
+            "handler": "email_reply_followup",
+            "topic": topic,
+            "email": payload["email"],
+            "draft": draft,
+        }
+        self._activate_followup(question_id, topic)
+        sent = await self._emit_followup_choices(payload, "web_search")
+        if sent:
+            logger.info("[EmailHUD] Reply options A/B/C sent for query_id=%s", question_id)
+        return question_id
+
+    async def _generate_email_draft(self, email_meta: dict[str, Any], instruction: str | None) -> str:
+        prompt_instruction = (
+            "Draft a concise, polite reply in Jarvis butler style. Keep it short and clear."
+        )
+        if instruction:
+            prompt_instruction += f" User instruction: {instruction}"
+        subject = email_meta.get("subject") or "your recent email"
+        body = email_meta.get("body") or ""
+        messages = [
+            {"role": "system", "content": prompt_instruction},
+            {
+                "role": "user",
+                "content": (
+                    f"Original email subject: {subject}\n"
+                    f"Body:\n{body}\n"
+                    "Please craft a calm, professional response."
+                ),
+            },
+        ]
+        try:
+            completion = await asyncio.to_thread(
+                self.openai_client.chat.completions.create,
+                model=self.ai_model,
+                messages=messages,
+                max_tokens=MAX_CHAT_TOKENS,
+            )
+            return completion.choices[0].message.content.strip()
+        except Exception as exc:
+            logger.warning("[EmailDraft] Draft generation failed: %s", exc)
+            return ""
+
+    async def _handle_email_edit_instruction(self, instruction: str) -> str:
+        context = self.email_edit_context
+        if not context:
+            return "I don't recall which email draft we're editing, Sir."
+        question_id = context.get("question_id")
+        email_meta = context.get("email") or {}
+        draft = await self._generate_email_draft(email_meta, instruction)
+        context["draft"] = draft
+        self.pending_choices[question_id] = context
+        self.email_edit_context = None
+        if question_id in self._pending_email_reply_drafts:
+            self._pending_email_reply_drafts[question_id].update({"draft": draft, "email": email_meta})
+        await self._send_email_context_draft(question_id, draft)
+        topic = context.get("topic") or f"Email: {email_meta.get('subject', '(no subject)')}"
+        await self._send_email_reply_options(question_id, email_meta, topic, draft=draft)
+        return "Draft updated per your edits, Sir. Choose A to send, B to edit again, or C to discard."
 
     def _select_recent_messages(self, count: int = 1, unread_only: bool = False) -> list[dict]:
         """Select recent messages as a heuristic target."""
@@ -526,8 +1186,7 @@ class JARVISBrain:
             "metadata": {"origin_text": original_text},
         }
         self.pending_choices[question_id] = payload
-        self.conversation_state["awaiting_followup"] = True
-        self.conversation_state["last_question_id"] = question_id
+        self._activate_followup(question_id, topic)
 
         question_text = (
             "You asked me to mark all your emails read. Just to be safe: "
@@ -535,14 +1194,15 @@ class JARVISBrain:
             "C: Cancel."
         )
 
+        payload = {
+            "type": "followup_choices",
+            "question_id": question_id,
+            "topic": topic,
+            "choices": choices,
+        }
         try:
             if hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
-                await self._emit_hud_event({
-                    "type": "followup_choices",
-                    "question_id": question_id,
-                    "topic": topic,
-                    "choices": choices,
-                })
+                await self._emit_followup_choices(payload, "email")
                 logger.info("[FOLLOWUP] Sent followup_choices event for question_id=%s (email bulk)", question_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[FOLLOWUP] Failed to send followup_choices event: %s", exc)
@@ -690,23 +1350,23 @@ class JARVISBrain:
         if not ids:
             return "I couldn't find messages to delete, Sir."
         question_id = self._generate_question_id()
-        self.active_question_id = question_id
-        self.conversation_state["awaiting_followup"] = True
-        self.conversation_state["last_question_id"] = question_id
         self.pending_choices[question_id] = {
             "question_id": question_id,
             "handler": "email_delete",
             "message_ids": ids,
         }
+        topic = "Email delete confirmation"
+        self._activate_followup(question_id, topic)
         prompt = f"Do you want me to delete {len(ids)} message(s), Sir? A: Yes, delete. B: No change. C: Cancel."
+        payload = {
+            "type": "followup_choices",
+            "question_id": question_id,
+            "topic": topic,
+            "choices": {"A": "Delete", "B": "Leave unchanged", "C": "Cancel"},
+        }
         try:
             if hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
-                await self._emit_hud_event({
-                    "type": "followup_choices",
-                    "question_id": question_id,
-                    "topic": "Email delete confirmation",
-                    "choices": {"A": "Delete", "B": "Leave unchanged", "C": "Cancel"},
-                })
+                await self._emit_followup_choices(payload, "email")
                 logger.info("[EmailConfirm] Sent followup_choices question_id=%s", question_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[EmailConfirm] Failed to send HUD event: %s", exc)
@@ -765,21 +1425,29 @@ class JARVISBrain:
             return "I couldn't search your email right now, Sir."
 
         hud_sent = False
+        question_id = self._generate_question_id()
+        normalized_messages = [self._normalize_email_search_result(msg) for msg in messages]
+        if normalized_messages:
+            self._pending_email_search_results[question_id] = normalized_messages
+            self._prune_email_search_history()
         try:
-            await self._clear_reply_options()
             # For topic=email.search the HUD expects a list of email results, not A/B/C options.
             payload = {
                 "type": "updateReplyOptions",
-                "question_id": self._generate_question_id(),
+                "question_id": question_id,
                 "topic": "email.search",
-                "choices": messages,
+                "choices": normalized_messages,
             }
             hud_sent = await self._emit_hud_event(payload)
-            if hud_sent:
+            if normalized_messages:
+                followup_topic = f"Email search: {self._preview_text(search_query, 60)}"
+                reply_payload = self._make_email_hud_reply_options(question_id, topic=followup_topic)
+                await self._emit_followup_choices(reply_payload, "email")
+                self._activate_followup(question_id, followup_topic)
                 logger.info(
-                    "[EmailSearch] Sent HUD search results question_id=%s count=%d",
-                    payload["question_id"],
-                    len(messages),
+                    "[EmailHUD] Prepared %d results with follow-up choices for question_id=%s",
+                    len(normalized_messages),
+                    question_id,
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[EmailSearch] Failed to send HUD payload: %s", exc)
@@ -852,6 +1520,7 @@ class JARVISBrain:
             print("   Ô£ô Context manager loaded")
             
             self.proactive_engine = ProactiveSuggestionEngine()
+            self._init_agents()
             print("   Ô£ô Proactive engine loaded")
             
             print("")
@@ -863,6 +1532,27 @@ class JARVISBrain:
         except Exception as e:
             print(f"ÔØî Initialization error: {e}")
             raise
+
+    def _init_agents(self):
+        """Instantiate the domain agents that drive the router logic."""
+        self.web_search_agent = WebSearchAgent(
+            llm_client=self.openai_client,
+            file_service=self.file_service,
+            memory=self.memory,
+        )
+        self.memory_agent = MemoryAgent(memory_system=self.memory, file_service=self.file_service)
+        self.calendar_agent = CalendarAgent(file_service=self.file_service)
+        self.docs_agent = DocsAgent(llm_client=self.openai_client, file_service=self.file_service)
+        self.local_docs_agent = LocalDocsSearchAgent(file_service=self.file_service)
+        self.system_agent = SystemAgent(system_info=self.system_info)
+        self.agent_registry = {
+            self.web_search_agent.DOMAIN: self.web_search_agent,
+            self.memory_agent.DOMAIN: self.memory_agent,
+            self.calendar_agent.DOMAIN: self.calendar_agent,
+            self.docs_agent.DOMAIN: self.docs_agent,
+            self.local_docs_agent.DOMAIN: self.local_docs_agent,
+            self.system_agent.DOMAIN: self.system_agent,
+        }
     
     def _is_time_query(self, text):
         """
@@ -934,6 +1624,8 @@ class JARVISBrain:
             if match:
                 candidate = match.group("query").strip()
                 return candidate or None
+        if AstraMeaningNormalizer.looks_like_web_query(normalized):
+            return normalized or None
         return None
 
     @staticmethod
@@ -1273,31 +1965,401 @@ class JARVISBrain:
         }
         return self.memory.add_conversation_memory(text=text, metadata=metadata)
 
-    async def _handle_web_search(self, query: str):
-        timestamp = datetime.now()
-        results_payload = await search_web(query)
-        results = results_payload.get("results", []) if isinstance(results_payload, dict) else []
-        summary = await summarise_search_results(self.openai_client, query, results)
+    async def _handle_web_search(self, query: str, query_id: str | None = None):
+        intent = {"domain": WebSearchAgent.DOMAIN, "action": "search", "search_term": query}
+        response = await self._route_agent_intent(intent, query, query_id=query_id, return_response=True)
+        if not isinstance(response, dict):
+            logger.warning("[WebSearch] Unexpected response type: %s", type(response))
+            return "I couldn't search the web right now, Sir."
 
-        vault_path = self._write_web_search_to_vault(query, summary, results, timestamp)
-        memory_id = self._store_web_memory(query, summary, timestamp)
+        results = response.get("results") or []
+        question_id = query_id or self._generate_question_id()
+        normalized_results = [
+            self._normalize_web_search_result(item, idx)
+            for idx, item in enumerate(results, start=1)
+        ]
+        if normalized_results:
+            self._pending_web_search_results[question_id] = normalized_results
+            self._prune_web_search_history()
 
-        links = [{"title": r.get("title", ""), "url": r.get("url", "")} for r in results[:3] if r.get("url")]
-        spoken_len = len(summary or "")
-        if spoken_len > SPOKEN_LENGTH_WATERMARK:
-            logger.warning("Spoken response length high (web): %d chars", spoken_len)
+        try:
+            await self._handle_web_search_hud(intent, response, query_id=question_id, send_choices=False)
+            if normalized_results:
+                payload = {
+                    "type": "updateReplyOptions",
+                    "question_id": question_id,
+                    "topic": "web.search",
+                    "choices": normalized_results,
+                }
+                await self._emit_hud_event(payload)
+                followup_topic = response.get("metadata", {}).get("title") or f"Web search: {self._preview_text(query, 60)}"
+                reply_payload = self._make_web_hud_reply_options(question_id, topic=followup_topic)
+                await self._emit_followup_choices(reply_payload, "web_search")
+                self._activate_followup(question_id, followup_topic)
+                logger.info(
+                    "[WebHUD] Prepared %d results with follow-up choices for question_id=%s",
+                    len(normalized_results),
+                    question_id,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[WebSearch] HUD emit failed: %s", exc)
+
+        fallback_unclear = (
+            "I'm not able to get a reliable answer from the web right now, Sir. "
+            "Would you like me to open the top search page in the HUD instead?"
+        )
+        snippets_available = any(item.get("snippet") for item in normalized_results)
+        if not normalized_results or not snippets_available:
+            return fallback_unclear
+
+        grounded_speech = await self._generate_grounded_web_speech(query, normalized_results)
+        if grounded_speech:
+            return grounded_speech
+        return fallback_unclear
+
+    async def _generate_grounded_web_speech(self, query: str, results: list[dict[str, Any]]) -> str | None:
+        """Summarise web search snippets while strictly relying on the provided data."""
+        snippet_entries = []
+        for idx, item in enumerate(results[:3], start=1):
+            title = item.get("title") or f"Result {idx}"
+            snippet = item.get("snippet") or ""
+            url = item.get("url") or ""
+            snippet_entries.append(
+                f"- Title: {title}\n  Snippet: {snippet}\n  URL: {url}"
+            )
+        if not snippet_entries:
+            return None
+
+        system_prompt = (
+            "You are Jarvis, summarising web search results for Sir. "
+            "Use ONLY the information contained in the provided snippets. "
+            "If the snippets do not clearly answer the question, say that you're not sure "
+            "and suggest checking the HUD links instead of guessing. "
+            "Do not invent or guess numbers, dates, or statistics."
+        )
+        user_prompt = (
+            f"Original question: {query!r}\n\n"
+            "Here are web search snippets:\n" + "\n".join(snippet_entries)
+        )
+        try:
+            completion = await asyncio.to_thread(
+                self.openai_client.chat.completions.create,
+                model=self.ai_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=MAX_CHAT_TOKENS,
+            )
+            summary = completion.choices[0].message.content or ""
+            return summary.strip()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[WebHUD] Grounded summary failed: %s", exc)
+            return None
+
+    async def _handle_web_search_hud(
+        self,
+        intent: Dict[str, Any],
+        response: Dict[str, Any],
+        query_id: str | None,
+        send_choices: bool = True,
+        style: str | None = None,
+    ):
+        focus_text = response.get("focus_text")
+        context_points = response.get("context_points") or []
+        web_query = (intent.get("search_term") or response.get("query") or "").strip()
+        topic = response.get("metadata", {}).get("title") or f"Web search: {self._preview_text(web_query, 60)}"
+        resolved_style = style or response.get("style") or "standard"
+        await self._send_focus_panel(query_id, web_query, focus_text)
+        await self._send_context_panel(query_id, web_query, context_points)
+        if send_choices:
+            await self._send_web_reply_options(query_id, web_query, topic, resolved_style)
         else:
-            logger.info("Spoken response length (web): %d chars", spoken_len)
-        payload = {
-            "spoken_text": summary,
-            "extra": {"links": links} if links else {},
-        }
-        if vault_path:
-            payload["vault_path"] = vault_path
-        if memory_id:
-            payload["memory_id"] = memory_id
+            self._schedule_web_reply_options(query_id, web_query, topic, resolved_style)
 
-        return payload
+    async def _handle_web_search_followup(self, payload: dict, choices: list[str]):
+        question_id = payload.get("question_id")
+        query = (payload.get("query") or "").strip()
+        if not query:
+            return "I couldn't find the original web query to follow up on, Sir."
+        self.pending_choices.pop(question_id, None)
+        choice = next((ch for ch in choices if ch in ("A", "B", "C")), None)
+        if not choice:
+            return "I didn't catch which option you wanted, Sir."
+        logger.info("[WebHUD] Followup choice received: %s", choice)
+        style_map = {"A": "deeper", "B": "angle", "C": "recap"}
+        style = style_map.get(choice, "standard")
+        intent = {
+            "domain": WebSearchAgent.DOMAIN,
+            "action": "search",
+            "search_term": query,
+            "parameters": {"style": style},
+        }
+        response = await self._route_agent_intent(intent, query, query_id=question_id, return_response=True)
+        await self._handle_web_search_hud(intent, response, query_id=question_id, send_choices=False, style=style)
+        topic = payload.get("topic") or f"Web search: {self._preview_text(query, 60)}"
+        self._schedule_web_reply_options(question_id, query, topic, style)
+        return response.get("speech") or "Here's the updated web search context, Sir."
+
+    async def _handle_web_search_selection(self, question_id: str, choices: list[str]) -> str:
+        """Process a web result selection coming from the HUD."""
+        results = self._pending_web_search_results.get(question_id, [])
+        if not results:
+            return "I couldn't find that web result, Sir."
+        selected_id = next((choice for choice in choices if choice), None)
+        if not selected_id:
+            return "I didn't catch which result you selected, Sir."
+        selected = next((item for item in results if str(item.get("id")) == str(selected_id)), None)
+        if not selected:
+            logger.warning(
+                "[WebHUD] Selection id=%s not in cached results for question_id=%s",
+                selected_id,
+                question_id,
+            )
+            return "That web result is no longer available, Sir."
+        await self._activate_web_focus_from_record(question_id, selected)
+        title = selected.get("title") or "that web result"
+        return f"Focused on {title}, Sir."
+
+    async def _handle_web_hud_followup(self, question_id: str, choices: list[str]) -> str:
+        """Handle HUD-level web actions (open/summarise/search docs) on the focused result."""
+        if not choices:
+            return "I didn't catch which action you wanted, Sir."
+        action = choices[0]
+        record = getattr(self, "current_web_result", None) or getattr(self, "_last_web_focus", None)
+        if not record:
+            return "I don't have a web result in focus to work with, Sir."
+
+        title = record.get("title") or "that web result"
+
+        if action == "open_web_result":
+            await self._activate_web_focus_from_record(question_id, record)
+            url = record.get("url")
+            if url:
+                return f"Focused on {title}. URL: {url}"
+            return f"Focused on {title}, Sir."
+
+        if action == "summarise_web_result":
+            snippet = record.get("snippet") or ""
+            if not snippet:
+                return "I don't have enough information from that result to summarise, Sir."
+            prompt = (
+                "Summarise this web search result in 2-3 sentences suitable for voice. "
+                "Mention the main page title and why it might be useful."
+            )
+            try:
+                completion = await asyncio.to_thread(
+                    self.openai_client.chat.completions.create,
+                    model=self.ai_model,
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {
+                            "role": "user",
+                            "content": (
+                                f"Title: {title}\n"
+                                f"URL: {record.get('url', '')}\n\n"
+                                f"{snippet}"
+                            ),
+                        },
+                    ],
+                    max_tokens=MAX_CHAT_TOKENS,
+                )
+                summary = completion.choices[0].message.content or ""
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[WebHUD] Summarisation failed: %s", exc)
+                return "I couldn't summarise that web result just now, Sir."
+            summary_text = summary.strip()
+            if not summary_text:
+                return "I couldn't summarise that web result just now, Sir."
+            await self._send_context_panel(question_id, title, [summary_text])
+            return f"Here's a brief summary of {title}, Sir."
+
+        if action == "search_docs_from_web_result":
+            return "I haven't wired document search from this web result yet, Sir, but the HUD is ready for it."
+
+        return "I couldn't interpret that follow-up action, Sir."
+
+    async def _handle_email_search_selection(self, question_id: str, choices: list[str]) -> str:
+        """Process an email result selection coming from the HUD."""
+        results = self._pending_email_search_results.get(question_id, [])
+        if not results:
+            return "I couldn't find that email result, Sir."
+        selected_id = next((choice for choice in choices if choice), None)
+        if not selected_id:
+            return "I didn't catch which email you selected, Sir."
+        selected = next((item for item in results if str(item.get("id")) == str(selected_id)), None)
+        if not selected:
+            logger.warning(
+                "[EmailHUD] Selection id=%s not in cached results for query_id=%s",
+                selected_id,
+                question_id,
+            )
+            return "That email is no longer available, Sir."
+        message_id = selected.get("id")
+        if not message_id:
+            return "That email result lacks an identifier, Sir."
+        try:
+            fetched = await asyncio.to_thread(fetch_full_message, message_id)
+        except FileNotFoundError:
+            return "Email access is not configured (missing Gmail token)."
+        except Exception as exc:
+            logger.warning("[EmailSearch] Failed to fetch full message id=%s: %s", message_id, exc)
+            fallback_meta = {
+                "id": selected.get("id"),
+                "threadId": selected.get("threadId") or selected.get("thread_id"),
+                "from": selected.get("from"),
+                "subject": selected.get("subject"),
+                "date": selected.get("date"),
+                "snippet": selected.get("snippet"),
+                "body": selected.get("body") or selected.get("snippet") or "",
+            }
+            fallback_record = self._build_email_focus_record(fallback_meta, fallback_meta.get("body"))
+            await self._activate_email_focus_from_record(question_id, fallback_record)
+            logger.info("[EmailHUD] Focus set from search for query_id=%s id=%s [partial data]", question_id, selected_id)
+            return "Focused on that email, Sir, though I could not load the full contents."
+        if isinstance(fetched, tuple) and len(fetched) >= 2:
+            meta, body = fetched[0], fetched[1]
+        elif isinstance(fetched, dict):
+            meta, body = fetched, fetched.get("body", "")
+        else:
+            return "I couldn't interpret that email, Sir."
+        focus_record = self._build_email_focus_record(meta, body)
+        await self._activate_email_focus_from_record(question_id, focus_record)
+        logger.info("[EmailHUD] Focus set from search for query_id=%s id=%s", question_id, selected_id)
+        return f"Focused on {focus_record.get('subject','that email')}, Sir."
+
+    async def _handle_email_reply_choice(self, question_id: str, choices: list[str]) -> str:
+        """Handle HUD reply options for drafts created from the selected email."""
+        draft_entry = self._pending_email_reply_drafts.get(question_id)
+        if not draft_entry:
+            return "I couldn't find that reply draft, Sir."
+        choice = next((ch.upper() for ch in choices if isinstance(ch, str) and ch.strip()), None)
+        if not choice:
+            return "I didn't catch which option you wanted, Sir."
+        logger.info("[EmailHUD] Reply choice %s for question_id=%s", choice, question_id)
+        if choice == "A":
+            payload = self.pending_choices.get(question_id)
+            if not payload:
+                return "Those reply options expired, Sir."
+            response = await self._process_email_reply_send(question_id, payload)
+            self._pending_email_reply_drafts.pop(question_id, None)
+            return response
+        if choice == "B":
+            self.email_edit_context = {
+                "question_id": question_id,
+                "email": draft_entry.get("email"),
+                "topic": "email.reply",
+            }
+            return "Tell me how you'd like to adjust the draft, Sir."
+        if choice == "C":
+            self._pending_email_reply_drafts.pop(question_id, None)
+            self.pending_choices.pop(question_id, None)
+            await self._send_email_context_status(question_id, "Draft discarded.")
+            return "Draft discarded, Sir."
+        return "I didn't recognise that option, Sir."
+
+    async def _handle_email_reply_followup(self, payload: dict, choices: list[str]):
+        question_id = payload.get("question_id")
+        email_meta = payload.get("email") or {}
+        choice = next((ch for ch in choices if ch in ("A", "B", "C")), None)
+        if not choice:
+            return "I didn't catch which option you wanted, Sir."
+        logger.info("[EmailHUD] Followup choice received: %s", choice)
+        if choice == "A":
+            return await self._process_email_reply_send(question_id, payload)
+        if choice == "B":
+            self.email_edit_context = {
+                "question_id": question_id,
+                "email": email_meta,
+                "topic": payload.get("topic"),
+            }
+            return "What would you like me to change about the draft, Sir?"
+        await self._send_email_context_status(question_id, "Draft discarded.")
+        self.pending_choices.pop(question_id, None)
+        return "Understood, Sir. The draft is discarded."
+
+    async def _process_email_reply_send(self, question_id: str, payload: dict):
+        email_meta = payload.get("email") or {}
+        draft = payload.get("draft") or ""
+        if not draft:
+            draft = await self._generate_email_draft(email_meta, None)
+            self.pending_choices[question_id]["draft"] = draft
+        to_addr = email_meta.get("from") or ""
+        thread_id = email_meta.get("threadId")
+        subject = email_meta.get("subject") or "your email"
+        if not subject.lower().startswith("re:"):
+            subject = f"Re: {subject}"
+        try:
+            result = await asyncio.to_thread(send_reply, thread_id, to_addr, subject, draft)
+        except Exception as exc:
+            return f"I couldn't send the reply: {exc}"
+        if not isinstance(result, dict) or not result.get("success"):
+            reason = result.get("reason") if isinstance(result, dict) else "unknown error"
+            return f"I couldn't send the reply: {reason}"
+        status = f"Reply sent successfully to {to_addr or 'the sender'}."
+        await self._send_email_context_status(question_id, status)
+        self.pending_choices.pop(question_id, None)
+        return status
+
+    async def _route_agent_intent(
+        self,
+        intent: Dict[str, Any],
+        raw_text: str | None = None,
+        query_id: str | None = None,
+        return_response: bool = False,
+    ) -> str | Dict[str, Any] | None:
+        if not intent:
+            return None
+        domain = intent.get("domain")
+        if not domain:
+            return None
+        agent = getattr(self, "agent_registry", {}).get(domain)
+        if not agent:
+            return None
+
+        context = {"original_text": raw_text or ""}
+        try:
+            response = await agent.execute(intent, context=context)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[AgentRoute] %s agent failed: %s", domain, exc)
+            fallback = {
+                "status": "error",
+                "speech": "I couldn't complete that request right now, Sir.",
+                "error": str(exc),
+            }
+            if return_response:
+                return fallback
+            return fallback["speech"]
+
+        if return_response:
+            return response
+
+        speech = response.get("speech") or response.get("message")
+        if not speech:
+            speech = "I've handled your request, Sir."
+
+        if domain == WebSearchAgent.DOMAIN:
+            if hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
+                try:
+                    await self._handle_web_search_hud(intent, response, query_id=query_id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[AgentRoute] Web HUD emit failed: %s", exc)
+            return speech
+
+        hud_payload = response.get("hud")
+        if hud_payload and hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
+            reply_options = response.get("reply_options")
+            try:
+                await self._send_hud_panel(
+                    hud_payload,
+                    query_id=query_id,
+                    reply_options=reply_options,
+                    reset_hud=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[AgentRoute] HUD emit failed: %s", exc)
+
+        return speech
 
     async def _handle_email_summary(self):
         try:
@@ -1398,7 +2460,7 @@ class JARVISBrain:
             "library_path": library_path,
         }
 
-    async def _handle_email_read(self, text: str):
+    async def _handle_email_read(self, text: str, query_id: str | None = None):
         parsed = self._parse_email_read_request(text)
         sender = parsed.get("sender")
         topic = parsed.get("topic")
@@ -1514,6 +2576,7 @@ class JARVISBrain:
             "subject": meta.get("subject"),
             "date": meta.get("date"),
             "body": body,
+            "snippet": meta.get("snippet") or (body or "")[:240],
         }
         self.current_email_identity = canonical
         logger.info(
@@ -1522,6 +2585,7 @@ class JARVISBrain:
             meta.get("subject"),
             meta.get("from"),
         )
+        self._last_email_focus = dict(self.current_email)
 
         # Decide hybrid mode based on body length
         body_len = len(body or "")
@@ -1587,50 +2651,36 @@ class JARVISBrain:
         except Exception as exc:
             logger.warning("[EmailRead] Failed to record read metadata: %s", exc)
 
+        await self._send_email_focus_panel(query_id, self.current_email)
+        await self._send_email_context_summary(query_id, summary_text or "Summary unavailable.")
+        email_topic = f"Email: {self._preview_text(meta.get('subject', ''), 60)}"
+        await self._send_email_reply_options(query_id, self.current_email, email_topic)
         return {
             "spoken_text": spoken_text,
             "extra": {"mode": mode, "message_id": meta.get("id")},
         }
 
     async def _handle_email_reply_request(self, text: str):
-        if not self.current_email:
-            return "I don’t have a recent email in focus to reply to, Sir. Ask me to read an email first."
+        if not self._last_email_focus:
+            return "I don’t have a recent email in focus to reply to, Sir. Ask me to read or select an email first."
 
-        target = self.current_email
-        logger.info("[EmailReply] Detected reply intent for message_id=%s", target.get("id"))
-        instruction = text
-        try:
-            completion = await asyncio.to_thread(
-                self.openai_client.chat.completions.create,
-                model=self.ai_model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "Draft a concise, polite reply in Jarvis butler style. "
-                            "Keep it short and clear. Do not include quoted text."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Original email subject: {target.get('subject')}\n\nBody:\n{target.get('body')}\n\nUser instruction: {instruction}",
-                    },
-                ],
-                max_tokens=MAX_CHAT_TOKENS,
-            )
-            draft = completion.choices[0].message.content or ""
-        except Exception as exc:
-            logger.error("[EmailReply] Draft failed: %s", exc)
-            return f"I couldn't draft a reply: {exc}"
+        email_meta = self._last_email_focus
+        logger.info("[EmailReply] Drafting reply for message_id=%s", email_meta.get("id"))
+        draft = await self._generate_email_draft(email_meta, text)
+        if not draft:
+            logger.warning("[EmailReply] Draft generation returned empty for message_id=%s", email_meta.get("id"))
+            return "I couldn't draft a reply right now, Sir."
 
-        self.pending_reply = {
-            "target": target,
+        question_id = await self._send_email_reply_options(None, email_meta, "email.reply", draft=draft)
+        self._pending_email_reply_drafts[question_id] = {
             "draft": draft,
+            "email": dict(email_meta),
         }
-        logger.info("[EmailReply] Drafted reply for message_id=%s: %s", target.get("id"), draft)
+        await self._send_email_context_draft(question_id, draft)
+        logger.info("[EmailReply] Drafted reply for message_id=%s question_id=%s", email_meta.get("id"), question_id)
         return {
-            "spoken_text": f"Here is my proposed reply, Sir: {draft} Shall I send this reply?",
-            "extra": {"message_id": target.get("id")},
+            "spoken_text": "I’ve drafted a reply to this email, Sir. Choose A to send, B to edit, or C to discard.",
+            "extra": {"message_id": email_meta.get("id")},
         }
 
     async def _handle_reply_confirmation(self, confirm: bool):
@@ -2010,31 +3060,88 @@ class JARVISBrain:
         if not target:
             return "I couldn't confidently identify which event to cancel, Sir."
         question_id = self._generate_question_id()
-        self.active_question_id = question_id
-        self.conversation_state["awaiting_followup"] = True
-        self.conversation_state["last_question_id"] = question_id
         self.pending_choices[question_id] = {
             "question_id": question_id,
             "handler": "calendar_delete_event",
             "event": target,
         }
+        topic = "Calendar delete confirmation"
+        self._activate_followup(question_id, topic)
         summary = target.get("summary", "the event")
         start = target.get("start", {}) or {}
         when = start.get("date") or start.get("dateTime") or "the scheduled time"
         prompt = f"Do you want me to cancel '{summary}' on {when}, Sir? A: Yes, cancel it. B: Move it instead (not implemented). C: No, leave it."
+        payload = {
+            "type": "followup_choices",
+            "question_id": question_id,
+            "topic": topic,
+            "choices": {"A": "Cancel it", "B": "Move it instead", "C": "Do nothing"},
+        }
         try:
             if hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
-                await self._emit_hud_event({
-                    "type": "followup_choices",
-                    "question_id": question_id,
-                    "topic": "Calendar delete confirmation",
-                    "choices": {"A": "Cancel it", "B": "Move it instead", "C": "Do nothing"},
-                })
+                await self._emit_followup_choices(payload, "calendar")
                 logger.info("[CalendarConfirm] Sent followup_choices question_id=%s", question_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[CalendarConfirm] Failed to send HUD event: %s", exc)
         return prompt
-    
+   
+    def _maybe_force_web_search(self, text: str, intent: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Ensure general WH-questions without personal context invoke web search."""
+        if not intent:
+            return intent
+        domain = intent.get("domain")
+        skip_domains = {"email", "calendar", "docs", "reminder", "search", WebSearchAgent.DOMAIN}
+        if domain in skip_domains:
+            return intent
+        normalized_text = (text or "").lower().strip()
+        if not normalized_text:
+            return intent
+        sanitized = re.sub(r"[^a-z0-9 ]+", " ", normalized_text)
+        sanitized = re.sub(r"\s+", " ", sanitized).strip()
+        if not sanitized:
+            return intent
+        personal_patterns = (
+            "my email",
+            "my emails",
+            "in my email",
+            "my inbox",
+            "my calendar",
+            "my agenda",
+            "my schedule",
+            "my docs",
+            "my documents",
+            "my files",
+            "that file",
+            "this file",
+            "my notes",
+        )
+        if any(pattern in sanitized for pattern in personal_patterns):
+            return intent
+        wh_prefixes = (
+            "who ",
+            "what ",
+            "where ",
+            "when ",
+            "which ",
+            "whom ",
+            "whose ",
+            "how many ",
+            "how much ",
+            "what s ",
+            "whats ",
+            "who s ",
+            "whos ",
+            "where s ",
+            "wheres ",
+        )
+        if any(sanitized.startswith(prefix) for prefix in wh_prefixes):
+            forced = dict(intent)
+            forced["domain"] = WebSearchAgent.DOMAIN
+            forced["action"] = "search"
+            forced["search_term"] = forced.get("search_term") or text
+            return forced
+        return intent
+
     async def process_text_input(self, user_input):
         """
         Process text input and generate response
@@ -2080,6 +3187,10 @@ class JARVISBrain:
 
             handshake_result = self._run_conversation_handshake(working_input)
             working_input = handshake_result.get("final_text", working_input)
+            if self.email_edit_context:
+                return await self._handle_email_edit_instruction(working_input)
+            query_id = self._generate_question_id()
+            await self._reset_hud_for_new_query(query_id)
 
             logger.info("Intent routing: text='%s'", working_input)
 
@@ -2102,25 +3213,47 @@ class JARVISBrain:
             normalized_intent = None
             if self.meaning_normalizer:
                 normalized_intent = self.meaning_normalizer.normalize(working_input)
+                if (
+                    AstraMeaningNormalizer.looks_like_web_query(working_input)
+                    and normalized_intent.get("domain") not in {"web_search", ""}
+                ):
+                    normalized_intent["domain"] = WebSearchAgent.DOMAIN
+                    normalized_intent["action"] = "search"
+                    normalized_intent["search_term"] = normalized_intent.get("search_term") or working_input
                 if normalized_intent.get("domain") == "clarify":
                     return normalized_intent.get("question") or "Could you clarify your request, Sir?"
 
-            if normalized_intent and normalized_intent.get("domain") == "email" and normalized_intent.get("action") in {"search", "search_emails_by_query"}:
+            routed_intent = self._maybe_force_web_search(working_input, normalized_intent)
+            if routed_intent is not normalized_intent and routed_intent and routed_intent.get("domain") == WebSearchAgent.DOMAIN:
+                logger.info(
+                    "[Router] Escalated general WH-question to web_search: search_term=%r",
+                    routed_intent.get("search_term"),
+                )
+
+            if routed_intent and routed_intent.get("domain") == "email" and routed_intent.get("action") in {"search", "search_emails_by_query"}:
                 logger.info("[EmailSearch] Routing to email search handler via normalizer: %s", working_input)
                 return await self._handle_email_search(
                     working_input,
-                    query=normalized_intent.get("search_term") or working_input,
-                    fuzzy_allowed=bool(normalized_intent.get("fuzzy_allowed")),
+                    query=routed_intent.get("search_term") or working_input,
+                    fuzzy_allowed=bool(routed_intent.get("fuzzy_allowed")),
                 )
-            if normalized_intent and normalized_intent.get("domain") == "web_search" and normalized_intent.get("action") == "search":
-                term = normalized_intent.get("search_term") or working_input
-                logger.info("[WebSearch] Routing to web search via normalizer: %s", term)
-                return await self._handle_web_search(term)
+            if (
+                routed_intent
+                and routed_intent.get("domain") in {WebSearchAgent.DOMAIN, "search"}
+                and routed_intent.get("action") in {"search", "web_search"}
+            ):
+                web_query = routed_intent.get("search_term") or working_input
+                logger.info("[WebSearch] Routing to web search handler via normalizer: %s", web_query)
+                return await self._handle_web_search(web_query, query_id=query_id)
+            if routed_intent:
+                agent_response = await self._route_agent_intent(routed_intent, working_input, query_id=query_id)
+                if agent_response:
+                    return agent_response
 
             search_query = self._extract_search_query(working_input)
             if search_query:
                 logger.info("Routing to web search handler.")
-                return await self._handle_web_search(search_query)
+                return await self._handle_web_search(search_query, query_id=query_id)
 
             if self._is_mark_read_intent(working_input):
                 logger.info(f"[EmailMarkRead] Detected mark-as-read intent: \"{working_input}\"")
@@ -2128,7 +3261,7 @@ class JARVISBrain:
 
             if self._is_email_read_intent(working_input):
                 logger.info(f"[EmailRead] Routing to read-email handler: {working_input}")
-                return await self._handle_email_read(working_input)
+                return await self._handle_email_read(working_input, query_id=query_id)
 
             if self._is_email_bulk_risky(working_input):
                 logger.info("[EmailBulkRisk] Detected risky bulk email intent: %s", working_input)
@@ -2236,14 +3369,12 @@ class JARVISBrain:
                 logger.info("Spoken response length: %d chars", spoken_len)
 
             if self._detect_followup_prompt(ai_response):
-                # Clear any previous active question defensively
-                self.active_question_id = None
-                await self._clear_reply_options()
+                prev_id = self.active_followup_question_id
+                if prev_id:
+                    await self._clear_reply_options(prev_id)
                 question_id = self._generate_question_id()
-                self.active_question_id = question_id
-                self.conversation_state["awaiting_followup"] = True
-                self.conversation_state["last_question_id"] = question_id
                 choices_payload = self._build_followup_choices(question_id, topic=self._preview_text(working_input, 60))
+                self._activate_followup(question_id, choices_payload.get("topic"))
                 logger.info(
                     "[DIALOG] Assistant asked a follow-up; awaiting user reply. question_id=%s",
                     question_id,
@@ -2251,20 +3382,19 @@ class JARVISBrain:
                 try:
                     # Emit HUD event for follow-up choices if server supports it
                     if hasattr(self, "hud_event_sink") and callable(self.hud_event_sink):
-                        await self._emit_hud_event({
+                        payload = {
                             "type": "followup_choices",
                             "question_id": question_id,
                             "topic": choices_payload.get("topic"),
                             "choices": choices_payload.get("choices"),
-                        })
+                        }
+                        await self._emit_followup_choices(payload, "general")
                         logger.info("[FOLLOWUP] Sent followup_choices event for question_id=%s", question_id)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[FOLLOWUP] Failed to send followup_choices event: %s", exc)
             else:
-                self.active_question_id = None
                 self.conversation_state["awaiting_followup"] = False
                 self.conversation_state["last_question_id"] = None
-                await self._clear_reply_options()
 
             return ai_response
 

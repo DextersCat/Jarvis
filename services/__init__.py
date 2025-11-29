@@ -23,6 +23,7 @@ from .calendar_service import (
     get_today_agenda,
     get_tomorrow_agenda,
     get_next_important_event,
+    get_events_between,
     write_calendar_briefing,
     build_daily_markdown,
     create_event,
@@ -36,7 +37,13 @@ from .tasks_service import (
     complete_task,
     delete_task,
 )
-from .docs_service import create_doc, append_to_doc
+from .docs_service import (
+    append_to_doc,
+    create_doc,
+    fetch_document,
+    render_document_text,
+    search_docs,
+)
 from .sheets_service import create_sheet, append_row
 from .slides_service import create_presentation, add_title_slide
 from .drive_service import find_file, rename_file, move_file, delete_file
@@ -63,6 +70,7 @@ __all__ = [
     "get_today_agenda",
     "get_tomorrow_agenda",
     "get_next_important_event",
+    "get_events_between",
     "write_calendar_briefing",
     "build_daily_markdown",
     "create_event",
@@ -75,6 +83,9 @@ __all__ = [
     "delete_task",
     "create_doc",
     "append_to_doc",
+    "fetch_document",
+    "search_docs",
+    "render_document_text",
     "create_sheet",
     "append_row",
     "create_presentation",

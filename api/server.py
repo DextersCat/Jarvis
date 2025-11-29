@@ -160,15 +160,19 @@ class JARVISWebSocketServer:
                     await asyncio.wait_for(pong_waiter, timeout=HEARTBEAT_TIMEOUT)
                     link_logger.debug("[HEARTBEAT] Pong received link=%s", connection_id)
                 except asyncio.TimeoutError:
-                    link_logger.warning("[HEARTBEAT] Missed pong; closing link=%s reason=ping_timeout", connection_id)
-                    await websocket.close(code=1001, reason="ping_timeout")
-                    link_logger.warning("[HEARTBEAT] Closed link=%s with code=1001 reason=ping_timeout", connection_id)
+                    link_logger.warning(
+                        "[HEARTBEAT] Missed pong; reporting ping_timeout for link=%s (no close issued)",
+                        connection_id,
+                    )
+                    ctx = self.connection_ctx.get(connection_id)
+                    if ctx is not None:
+                        ctx["heartbeat_failed"] = True
                     return
                 except Exception as exc:  # noqa: BLE001
                     link_logger.error("[HEARTBEAT] Ping failed link=%s error=%s", connection_id, exc)
-                    with contextlib.suppress(Exception):
-                        await websocket.close(code=1001, reason="ping_error")
-                        link_logger.warning("[HEARTBEAT] Closed link=%s with code=1001 reason=ping_error", connection_id)
+                    ctx = self.connection_ctx.get(connection_id)
+                    if ctx is not None:
+                        ctx["heartbeat_failed"] = True
                     return
         except asyncio.CancelledError:
             link_logger.info("[HEARTBEAT] Ping loop cancelled link=%s", connection_id)
@@ -423,7 +427,18 @@ class JARVISWebSocketServer:
                     elif msg_type == "simple_local_reply":
                         text = data.get("text") or ""
                         logger.info("Handling simple_local_reply as chat-response passthrough: '%s'", text)
+                        try:
+                            await self.brain._handle_hud_clear()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("[LINK %s] Simple reply HUD clear failed: %s", connection_id, exc)
                         await self.send_tts_audio(websocket, text, connection_id)
+
+                    elif msg_type == "hud_init_clear":
+                        logger.info("[LINK %s] HUD init clear requested", connection_id)
+                        try:
+                            await self.brain._handle_hud_clear()
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("[LINK %s] HUD init clear failed: %s", connection_id, exc)
 
                     else:
                         logger.warning(f"Unknown message type: {msg_type}")

@@ -99,6 +99,17 @@ def get_next_important_event() -> Optional[Dict]:
     return events[0] if events else None
 
 
+def get_events_between(start_dt: datetime, end_dt: datetime, max_results: int = 20) -> List[Dict]:
+    service = _load_calendar_service()
+    try:
+        events = _fetch_events(service, start_dt.isoformat(), end_dt.isoformat(), max_results=max_results)
+        logger.info("Calendar events fetched between %s and %s: %d", start_dt, end_dt, len(events))
+        return events
+    except HttpError as exc:
+        logger.error("Calendar range fetch failed: %s", exc)
+        raise
+
+
 def build_daily_markdown(day_label: str, events: List[Dict]) -> str:
     now = datetime.now(timezone.utc)
     lines = [

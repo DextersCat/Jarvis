@@ -5,6 +5,7 @@ import os
 import urllib.parse
 import urllib.request
 from typing import Dict, List
+from urllib.error import HTTPError, URLError
 
 logger = logging.getLogger(__name__)
 
@@ -47,21 +48,30 @@ def _make_request(url: str):
     return json.loads(payload.decode("utf-8"))
 
 
+def _format_http_error(exc: HTTPError) -> str:
+    reason = exc.reason or ""
+    return f"HTTP {exc.code}: {reason}"
+
+
 async def search_web(query: str, num_results: int = 5) -> dict:
     """
     Call Google Programmable Search (CSE) with the given query.
-    Return {"query": str, "results": [{"title": str, "snippet": str, "url": str}, ...]}.
-    Handle HTTP/network errors gracefully and return an empty 'results' list on failure.
+    Return a dict with status, query, results, and optional error details.
     """
 
     trimmed = (query or "").strip()
     if not trimmed:
-        return {"query": query, "results": []}
+        return {"query": query, "results": [], "ok": False, "error": "Missing query"}
 
     api_key, cx = _get_google_credentials()
     if not api_key or not cx:
         logger.warning("Google Search CSE credentials missing; returning no results.")
-        return {"query": query, "results": []}
+        return {
+            "query": trimmed,
+            "results": [],
+            "ok": False,
+            "error": "Google Search CSE credentials not configured",
+        }
 
     url = _build_request_url(trimmed, num_results)
 
@@ -70,13 +80,24 @@ async def search_web(query: str, num_results: int = 5) -> dict:
         data = await loop.run_in_executor(None, _make_request, url)
         items = data.get("items", []) if isinstance(data, dict) else []
         results = _parse_results(items, num_results)
-        return {"query": query, "results": results}
+        return {"query": trimmed, "results": results, "ok": True}
+    except HTTPError as exc:
+        logger.error("Web search HTTP error: %s", exc)
+        return {
+            "query": trimmed,
+            "results": [],
+            "ok": False,
+            "error": _format_http_error(exc),
+        }
+    except URLError as exc:
+        logger.error("Web search network error: %s", exc)
+        return {"query": trimmed, "results": [], "ok": False, "error": str(exc)}
     except Exception as exc:
         logger.exception("Web search failed: %s", exc)
-        return {"query": query, "results": []}
+        return {"query": trimmed, "results": [], "ok": False, "error": str(exc)}
 
 
-async def summarise_search_results(llm_client, query: str, results: List[dict]) -> str:
+async def summarise_search_results(llm_client, query: str, results: List[dict], style: str = "standard") -> str:
     """
     Use the existing Jarvis LLM pipeline (LLaMA3 via Ollama) to generate a 2–4 sentence spoken summary
     plus a few bullet points. The returned string should be suitable for both TTS and markdown.
@@ -94,11 +115,20 @@ async def summarise_search_results(llm_client, query: str, results: List[dict]) 
         url = item.get("url", "")
         bullet_lines.append(f"{idx}. {title} — {url}")
 
+    style_value = (style or "standard").lower()
+    style_prompts = {
+        "deeper": "You should take a deeper dive and highlight extra context, background, or nuance. "
+        "Add a little more richness, but stay factual, and mention why each point matters.",
+        "angle": "You should provide an alternate angle or perspective on the topic, focusing on a different lens than usual.",
+        "recap": "You should tightly recap the essentials in a single paragraph before the bullet list, keeping it brief.",
+    }
+    extra_instructions = style_prompts.get(style_value, "")
     prompt = (
         "You are Jarvis generating a concise spoken recap of web search results. "
         "Provide 2-4 sentences that sound natural when read aloud, followed by 2-4 bullet points. "
         "Keep it factual and avoid speculation. "
-        "Keep the whole reply tight for TTS and end with: 'Let me know if you'd like more detail, Sir.'"
+        + extra_instructions
+        + " Keep the whole reply tight for TTS and end with: 'Let me know if you'd like more detail, Sir.'"
     )
 
     messages = [
